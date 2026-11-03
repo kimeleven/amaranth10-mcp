@@ -88,6 +88,18 @@ test("a get is a signed GET of the query whose server-sent data line is the repl
     sign(SIGN_KEY, TOKEN, init.headers["transaction-id"], init.headers.timestamp, "/eap/sse/eap107A25"));
 });
 
+test("a file request answers an attachment's bytes; any other reply is checked as JSON", async () => {
+  const disposition = "attachment; filename*=UTF-8''a.pdf";
+  const file = async () => new Response(Buffer.from("%PDF"), { headers: { "content-disposition": disposition } });
+  assert.deepEqual(await request(SESSION, "/ecm/ecm017A02", { docUIDs: "D1" }, { fetch: file, file: true }),
+    { bytes: Buffer.from("%PDF"), disposition });
+  // live 2026-11-03: a folder or unknown uid answers HTTP 200 with a JSON failure
+  await assert.rejects(request(SESSION, "/ecm/ecm017A02", {}, { file: true,
+    fetch: async () => json({ resultCode: 10503, resultMsg: "파일 UID가 전달되지 않았습니다." }) }),
+  (e) => e instanceof GroupwareError && e.message === "/ecm/ecm017A02: 파일 UID가 전달되지 않았습니다.");
+  await assert.rejects(request(SESSION, "/x", {}, { fetch: file }), /non-JSON response/);   // only when asked for
+});
+
 test("request maps failures to session and groupware errors", async () => {
   const p = "/mail/api/mail019A01";
   for (const [name, reply, type, message] of [

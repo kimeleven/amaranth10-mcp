@@ -1,5 +1,9 @@
 // The reads: each fetchX(session, args, {fetch}) takes the tool's parameters by their names and
 // returns the objects the tool answers with.
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { GroupwareError, request } from "./client.js";
 
 // ---- HTML to text. Other people's HTML is only reduced to text, never followed. Every pattern is
@@ -469,6 +473,7 @@ const APPROVAL_BOXES = {
   submitted: ["/eap/eap107A04", "UBA1010", "REP_DT", "1000300", "1000400", "list"],
   draft: ["/eap/eap107A06", "UBA1020", "REP_DT", "1000300", "1000500", "list"],
   pending: ["/eap/eap105A04", "UBA2020", "ARRIVED_DT", "1000900", "1001000", "map"],
+  reference: ["/eap/eap105A04", "UBA2040", "ARRIVED_DT", "1000900", "1001200", "map"],   // 수신참조문서 (gw999A03, live 2026-11-03)
 };
 const DOC_STATUS = { 10: "임시보관", 20: "상신", 90: "종결" };
 
@@ -497,35 +502,74 @@ export async function fetchApprovals(session, { box = "submitted", start = null,
   }));
 }
 
+// the viewer (popup UBAP002). eap110A03 is the drafting form: on someone else's document it answers the
+// reader's own default line (live 2026-11-03), so a 수신참조 document read wrong there.
 export async function fetchApproval(session, { doc_id, form_id } = {}, { fetch } = {}) {
-  const data = (await request(session, "/eap/eap110A03",
-    { docID: String(doc_id), formID: String(form_id), approkey: "", pageCode: "UBAP001" }, { fetch })) || {};
-  const m = data.resultMap || {};
-  let info = m.appdocinfo || {};
-  if (Array.isArray(info)) info = info[0] || {};
-  const status = String(data.doc_sts || info.doc_sts || "");
-  const title = info.doc_title || data.doc_title || "", line = data.jsonKyuljaeArr || [];
-  // an unknown id answers success with every field empty; a real document has a title and a line
+  const data = (await request(session, "/eap/eap111A04", { doc_id: String(doc_id), form_id: String(form_id), bindType: "P",
+    doc_auth: "0", mode: "", approkey: "", spApprokey: "", docToken: "" }, { fetch })) || {};
+  const title = data.docTitle || "", line = data.line || [];
+  // an unknown or forbidden id is an error code; a reply with neither title nor line is no document either
   if (!title && !line.length) {
     throw new GroupwareError(`결재 문서(doc_id ${doc_id}, form_id ${form_id})를 찾을 수 없습니다. approval_list의 doc_id·form_id를 넣어 주세요.`);
   }
   return {
     title,
-    status: DOC_STATUS[status] ?? status,
-    drafter: info.user_nm || data.user_nm || "",
-    dept: info.dept_nm || data.dept_nm || "",
-    form: info.form_nm || "",
-    // live 2026-10-16: work_order was 1 on every step and app_yn "0" even on a finished
-    // document, so seq gives the order and no per-step approval flag is claimed
+    status: data.docStsName || (DOC_STATUS[data.docSts] ?? data.docSts ?? null),
+    drafter: data.empName || "",
+    dept: data.deptName || "",
+    form: data.formName || "",
+    // work_order is 1 on every step; doc_line_m_seq gives the order
     approval_line: line.map((s) => ({
-      order: s.seq ?? null,
+      order: s.doc_line_m_seq ?? null,
       step: s.act_nm || "",
       name: s.user_nm || "",
       duty: s.duty_nm || "",
       dept: s.dept_nm || "",
     })),
-    attachments: (m.fileAttachInfo || []).length,
-    // html is the form template (_DFxx_ placeholders); the filled body is mainhtml, else the stored contents
-    body: clean(data.mainhtml || m.appdoccontent?.[0]?.doc_contents),
+    attachments: data.attachCnt ?? null,
+    // contents is the whole form with its sign table; docContents is the body
+    body: clean(data.docContents),
   };
+}
+
+// ---- drive (OneChamber, /ecm). With no folder: my drive (MY_ROOT) and the company's (CO_ROOT, 전사문서함);
+// a search runs below each, since an empty uid finds nothing (live 2026-11-03).
+const KST = 9 * 3600_000;
+const fmtMs = (ms) => (Number.isFinite(ms) ? new Date(ms + KST).toISOString().slice(0, 16).replace("T", " ") : "");
+
+export async function fetchDrive(session, { folder = null, query = "", page = 1, count = 30 } = {}, { fetch } = {}) {
+  const out = [];
+  for (const uid of folder ? [folder] : ["MY_ROOT", "CO_ROOT"]) {
+    const data = await request(session, "/ecm/ecm040A01", { uid, page: String(page), pageSize: count, searchText: query,
+      searchType: "", includeChild: Boolean(query), sortField: "", sortOrder: "", flagUseListCount: true }, { fetch });
+    out.push(...rowsOf(data, "list", "/ecm/ecm040A01"));
+  }
+  return out.map((x) => {
+    const isFolder = x.fileExt === "folder";
+    return { uid: x.uid ?? null, name: x.name || "", folder: isFolder, size: isFolder ? null : x.fileSize ?? null,
+      modified: fmtMs(x.lastModifiedAt) };
+  });
+}
+
+const TEXT = /\.(txt|md|csv|tsv|json|xml|log)$/i;
+
+// the file into a fresh temp directory under its own name; a UTF-8 text file's text comes back too
+export async function readDriveFile(session, { uid } = {}, { fetch } = {}) {
+  const { bytes, disposition } = await request(session, "/ecm/ecm017A02", { docUIDs: String(uid) }, { fetch, file: true }) || {};
+  if (!Buffer.isBuffer(bytes)) throw new GroupwareError(`파일(uid ${uid})을 받지 못했습니다. drive_list의 파일 uid인지 확인해 주세요.`);
+  let name = String(uid);
+  try {
+    name = decodeURIComponent(/filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1] ?? "") || name;
+  } catch {}   // a bad escape: the uid names it
+  const safe = name.replace(/[\\/\0]/g, "_");   // the groupware's name must not climb out of the directory
+  const path = join(mkdtempSync(join(tmpdir(), "amaranth10-drive-")), [".", ".."].includes(safe) ? String(uid) : safe);
+  writeFileSync(path, bytes);
+  const out = { name, size: bytes.length, saved_to: path };
+  if (TEXT.test(name)) {
+    try {
+      const s = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      out.text = s.length > 20000 ? `${s.slice(0, 20000)} …(생략)` : s;
+    } catch {}   // not UTF-8 (an EUC-KR csv): the saved file only
+  }
+  return out;
 }

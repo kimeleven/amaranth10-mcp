@@ -1,11 +1,14 @@
-// leave, people, attendees, dates, resources, schedules and approvals
+// leave, people, attendees, dates, resources, schedules, approvals and the drive
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname } from "node:path";
 
 import { GroupwareError } from "../src/client.js";
 import {
-  fetchApproval, fetchApprovals, fetchDeptMembers, fetchLeaveBalance, fetchLeaveRequests,
-  fetchMyReservations, fetchResourceSchedule, fetchResources, fetchSchedule, resolveAttendees,
+  fetchApproval, fetchApprovals, fetchDeptMembers, fetchDrive, fetchLeaveBalance, fetchLeaveRequests,
+  fetchMyReservations, fetchResourceSchedule, fetchResources, fetchSchedule, readDriveFile, resolveAttendees,
   searchPeople, toApiDay, toApiDt,
 } from "../src/read.js";
 
@@ -289,7 +292,8 @@ test("fetchApprovals box contract", async () => {
   for (const [box, path, pageCode, picker, boxId, menuNo, shape] of [
     ["submitted", "/eap/eap107A04", "UBA1010", "REP_DT", "1000300", "1000400", "list"],
     ["draft", "/eap/eap107A06", "UBA1020", "REP_DT", "1000300", "1000500", "list"],
-    ["pending", "/eap/eap105A04", "UBA2020", "ARRIVED_DT", "1000900", "1001000", "map"]]) {
+    ["pending", "/eap/eap105A04", "UBA2020", "ARRIVED_DT", "1000900", "1001000", "map"],
+    ["reference", "/eap/eap105A04", "UBA2040", "ARRIVED_DT", "1000900", "1001200", "map"]]) {
     const { fetch, calls } = fake(() => ({ [shape]: { list: [DOC] } }));
     const out = await fetchApprovals(RES, { box, start: "2026-09-01", end: "2026-09-30", page: 2, count: 10 }, { fetch });
     const { path: sent, body } = calls[0];
@@ -315,33 +319,80 @@ test("fetchApprovals defaults to this year and rejects unknown boxes", async () 
   assert.deepEqual([calls[0].body.sfrDt, calls[0].body.stoDt], [`${year}0101`, `${year}1231`]);
 });
 
-test("fetchApproval maps the document, info as a list or a dict", async () => {
-  const info = { doc_title: "휴가신청", user_nm: "홍길동", dept_nm: "개발팀", form_nm: "휴가신청서" };
-  const line = [{ work_order: 1, seq: 1, act_nm: "결재", user_nm: "홍길동", duty_nm: "팀원", dept_nm: "개발팀", app_yn: "0" },
-    { work_order: 1, seq: 2, act_nm: "합의", user_nm: "김팀장", duty_nm: "팀장", dept_nm: "회계팀", app_yn: "0" }];
-  for (const appdocinfo of [[info], info]) {
-    const { fetch, calls } = fake(() => ({ doc_sts: "90", html: "<p>_DF10_</p>",
-      mainhtml: "<p>사유: 개인 사정</p><script>x()</script>", jsonKyuljaeArr: line,
-      resultMap: { appdocinfo, fileAttachInfo: [{}, {}] } }));
-    const out = await fetchApproval(RES, { doc_id: 1000187, form_id: 2036 }, { fetch });
-    assert.deepEqual(calls, [{ path: "/eap/eap110A03", body: { docID: "1000187", formID: "2036", approkey: "", pageCode: "UBAP001" } }]);
-    assert.deepEqual(out, { title: "휴가신청", status: "종결", drafter: "홍길동", dept: "개발팀", form: "휴가신청서",
-      approval_line: [{ order: 1, step: "결재", name: "홍길동", duty: "팀원", dept: "개발팀" },
-        { order: 2, step: "합의", name: "김팀장", duty: "팀장", dept: "회계팀" }],
-      attachments: 2, body: "사유: 개인 사정" });
-  }
+// live 2026-11-03: the viewer's reply for a document someone else drafted, with me in 수신참조
+test("fetchApproval reads the viewer: the document's own line, not the reader's", async () => {
+  const line = [{ doc_line_m_seq: 1, work_order: 1, act_nm: "결재", user_nm: "김민상", duty_nm: "팀장", dept_nm: "AI팀" },
+    { doc_line_m_seq: 2, work_order: 1, act_nm: "결재", user_nm: "임대근", duty_nm: "대표이사", dept_nm: "본사" }];
+  const { fetch, calls } = fake(() => ({ docTitle: "노트북 교체 품의", docSts: "90", docStsName: "종결", empName: "김민상",
+    deptName: "AI팀", formName: "품의서", line, attachCnt: 2, contents: "<html>_DF10_ 결재란</html>",
+    docContents: "<p>구매 목적: 교체</p><script>x()</script>" }));
+  const out = await fetchApproval(RES, { doc_id: 1004495, form_id: 2 }, { fetch });
+  assert.deepEqual(calls, [{ path: "/eap/eap111A04", body: { doc_id: "1004495", form_id: "2", bindType: "P", doc_auth: "0",
+    mode: "", approkey: "", spApprokey: "", docToken: "" } }]);
+  assert.deepEqual(out, { title: "노트북 교체 품의", status: "종결", drafter: "김민상", dept: "AI팀", form: "품의서",
+    approval_line: [{ order: 1, step: "결재", name: "김민상", duty: "팀장", dept: "AI팀" },
+      { order: 2, step: "결재", name: "임대근", duty: "대표이사", dept: "본사" }],
+    attachments: 2, body: "구매 목적: 교체" });
 });
 
-test("fetchApproval body falls back to the stored contents; an unknown document is an error", async () => {
-  const { fetch } = fake(() => ({ doc_sts: "20", html: "<p>_DF11_</p>", resultMap: { appdocinfo: { doc_title: "출장" },
-    appdoccontent: [{ doc_contents: "<body><p>출장 목적: 고객 미팅</p></body>" }] } }));
-  const out = await fetchApproval(RES, { doc_id: 7, form_id: 2040 }, { fetch });
-  assert.deepEqual([out.status, out.body], ["상신", "출장 목적: 고객 미팅"]);
-  // live: doc_id 1 / form_id 1 answers success with every field empty
-  for (const reply of [{}, { resultMap: { appdocinfo: [], appdoccontent: [] }, jsonKyuljaeArr: [] }]) {
+test("fetchApproval refuses a reply with neither title nor line", async () => {
+  for (const reply of [{}, { line: [], docTitle: "" }]) {
     await assert.rejects(fetchApproval(RES, { doc_id: 1, form_id: 1 }, { fetch: fake(() => reply).fetch }),
       isGw(/결재 문서\(doc_id 1, form_id 1\)를 찾을 수 없습니다/));
   }
+});
+
+// ---- drive (OneChamber)
+const FOLDER = { uid: "F1", name: "규정", fileExt: "folder", fileSize: 0, lastModifiedAt: 1788911080000 };   // 2026-09-09 08:44 KST
+const FILE = { uid: "D1", name: "업무분장규정.pdf", fileExt: "PDF", fileSize: 82689, lastModifiedAt: 1783901023000 };
+
+test("fetchDrive lists my drive and the company drive, or one folder", async () => {
+  const { fetch, calls } = fake((_p, body) => ({ listcount: 1, list: [body.uid === "MY_ROOT" ? FOLDER : FILE] }));
+  assert.deepEqual(await fetchDrive(RES, {}, { fetch }), [
+    { uid: "F1", name: "규정", folder: true, size: null, modified: "2026-09-09 08:44" },
+    { uid: "D1", name: "업무분장규정.pdf", folder: false, size: 82689, modified: "2026-07-13 09:03" }]);
+  assert.deepEqual(calls.map((c) => [c.path, c.body.uid, c.body.searchText, c.body.includeChild, c.body.page, c.body.pageSize]),
+    [["/ecm/ecm040A01", "MY_ROOT", "", false, "1", 30], ["/ecm/ecm040A01", "CO_ROOT", "", false, "1", 30]]);
+  calls.length = 0;
+  await fetchDrive(RES, { folder: "F1", query: "분장", page: 2, count: 10 }, { fetch });
+  assert.deepEqual(calls.map((c) => [c.body.uid, c.body.searchText, c.body.includeChild, c.body.page, c.body.pageSize]),
+    [["F1", "분장", true, "2", 10]]);
+});
+
+test("fetchDrive refuses a reply that is not a list of items", async () => {
+  await assert.rejects(fetchDrive(RES, { folder: "F1" }, { fetch: fake(() => ({ list: "x" })).fetch }), isGw(/unexpected response/));
+  assert.deepEqual(await fetchDrive(RES, { folder: "F1" }, { fetch: fake(() => ({ listcount: 0, list: null })).fetch }), []);
+});
+
+const attachment = (bytes, name) => async () => new Response(bytes, { headers: { "content-type": "application/octet-stream",
+  "content-disposition": `attachment; filename="____.x"; filename*=UTF-8''${encodeURIComponent(name)}` } });
+
+test("readDriveFile saves the file under its own name in a fresh directory", async (t) => {
+  const pdf = Buffer.from("%PDF-1.4 binary\u0000");
+  const calls = [];
+  const out = await readDriveFile(RES, { uid: "D1" }, { fetch: async (url, init) => {
+    calls.push([new URL(url).pathname, JSON.parse(init.body)]);
+    return attachment(pdf, "3-3 업무분장규정.pdf")();
+  } });
+  t.after(() => rmSync(dirname(out.saved_to), { recursive: true, force: true }));
+  assert.deepEqual(calls, [["/ecm/ecm017A02", { docUIDs: "D1" }]]);
+  assert.deepEqual([out.name, out.size, basename(out.saved_to), out.text], ["3-3 업무분장규정.pdf", pdf.length, "3-3 업무분장규정.pdf", undefined]);
+  assert.deepEqual(readFileSync(out.saved_to), pdf);
+});
+
+test("readDriveFile answers a UTF-8 text file's text too, and keeps a hostile name inside its directory", async (t) => {
+  const out = await readDriveFile(RES, { uid: "D2" }, { fetch: attachment("﻿회의 메모\n2026-11-03", "../../메모.txt") });
+  t.after(() => rmSync(dirname(out.saved_to), { recursive: true, force: true }));
+  assert.equal(out.text, "회의 메모\n2026-11-03");
+  assert.equal(basename(out.saved_to), ".._.._메모.txt");
+  assert.ok(dirname(out.saved_to).startsWith(tmpdir()));
+  const bad = await readDriveFile(RES, { uid: "D3" }, { fetch: attachment(Buffer.from([0xff, 0xfe, 0x00]), "euc.csv") });
+  t.after(() => rmSync(dirname(bad.saved_to), { recursive: true, force: true }));
+  assert.equal(bad.text, undefined);   // not UTF-8: the saved file only
+});
+
+test("readDriveFile refuses a reply that is no file", async () => {
+  await assert.rejects(readDriveFile(RES, { uid: "F1" }, { fetch: fake(() => ({})).fetch }), isGw(/파일\(uid F1\)을 받지 못했습니다/));
 });
 
 // ---- listings fail closed: a reply that is not a dict holding a list of dicts is an error, never an

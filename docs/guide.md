@@ -51,7 +51,8 @@
 | 자원·회의실 | `resource_reserve` · `resource_update` · `resource_cancel` | 자원 예약, 본인 예약 수정·취소 |
 | 일정 | `schedule_list` | 일정 조회 |
 | 일정 | `schedule_create` · `schedule_update` · `schedule_delete` | 개인 일정 등록·수정·삭제 |
-| 전자결재 | `approval_list` · `approval_read` | 결재 문서 목록 조회, 결재선과 본문 확인 |
+| 전자결재 | `approval_list` · `approval_read` | 상신·임시보관·미결·수신참조 문서 목록 조회, 결재선과 본문 확인 |
+| 드라이브 | `drive_list` · `drive_read` | 원챔버 내 드라이브·전사문서함의 폴더와 파일 조회·이름 검색. 파일은 임시 폴더에 저장하고 경로를 돌려주며, UTF-8 텍스트 파일은 내용도 확인 |
 | 조직도 | `people_search` · `dept_members` | 직원 검색 및 부서원 조회 |
 | 연차·휴가 | `leave_balance` · `leave_requests` | 남은 연차 및 휴가 신청 내역 조회 |
 | 연차·휴가 | `leave_request` · `leave_cancel` | 연차·반차·반반차 신청(전자결재 상신), 결재 전 신청 취소 |

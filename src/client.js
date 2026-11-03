@@ -37,10 +37,16 @@ const isObject = (x) => x !== null && typeof x === "object" && !Array.isArray(x)
 const tid = () => randomBytes(16).toString("hex");
 const now = () => String(Math.floor(Date.now() / 1000));
 
-async function send(fetch, url, init) {
+// with file, an attachment comes back as its bytes; any other reply (a failure too) as text
+async function send(fetch, url, init, file = false) {
   try {
     // manual: a redirect must not carry the token elsewhere
+    // ponytail: the whole file in memory within the 15 s timeout; stream it to disk if big files matter
     const resp = await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(15000) });
+    const disposition = resp.headers.get("content-disposition") || "";
+    if (file && /^\s*attachment/i.test(disposition)) {
+      return { status: resp.status, file: { bytes: Buffer.from(await resp.arrayBuffer()), disposition } };
+    }
     return { status: resp.status, text: await resp.text() };
   } catch (e) {
     throw new TransportError(e);
@@ -67,8 +73,10 @@ export function sign(signKey, token, tid, ts, pathname) {
 
 /** A signed POST: body as JSON, or a FormData as multipart; with get, a GET of pathname's query (the
  * approval delete, answered as one server-sent "data:" event). Returns resultData; with full, the whole
- * reply, its resultCode left to the caller (a send's "1" means sent with some recipients left out). */
-export async function request(session, pathname, body, { fetch = globalThis.fetch, full = false, get = false } = {}) {
+ * reply, its resultCode left to the caller (a send's "1" means sent with some recipients left out); with
+ * file, a download's {bytes, disposition}, a JSON reply still checked as usual. */
+export async function request(session, pathname, body,
+  { fetch = globalThis.fetch, full = false, get = false, file = false } = {}) {
   const path = pathname.split(/[?#]/)[0];
   const id = tid(), ts = now();
   const { base, token, signKey } = session;
@@ -84,9 +92,10 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
   let outcome = "no response";
   try {
     const resp = await send(fetch, base + pathname, get ? { method: "GET", headers } : { method: "POST", headers,
-      body: body instanceof FormData ? body : JSON.stringify(body) });
+      body: body instanceof FormData ? body : JSON.stringify(body) }, file);
     outcome = `HTTP ${resp.status}`;
     if (resp.status === 401 || resp.status === 403) throw new SessionError(`${path}: HTTP ${resp.status}`);
+    if (resp.file) return resp.file;
     if (!resp.text) throw new GroupwareError(`${path}: empty response (missing required field?)`);
     let data;
     try {

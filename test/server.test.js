@@ -96,7 +96,7 @@ test("numbers, flags and lists sent as JSON text are parsed; a str | int keeps i
     if (path === "/mail/mail003A01") return { Records: [] };
     if (path.endsWith("sc111A02")) return { resultList: CALS };
     if (path.endsWith("gw102A04")) return [KIM];
-    if (path.endsWith("eap110A03")) return { doc_title: "문서" };
+    if (path.endsWith("eap111A04")) return { docTitle: "문서" };
     return {};
   });
   const client = await connect(fake.gw);
@@ -123,7 +123,7 @@ test("numbers, flags and lists sent as JSON text are parsed; a str | int keeps i
   }
   assert.equal(fake.calls.length, sent);
   assert.equal((await client.callTool({ name: "approval_read", arguments: { doc_id: "123", form_id: 7 } })).isError, undefined);
-  assert.deepEqual([fake.calls.at(-1).body.docID, fake.calls.at(-1).body.formID], ["123", "7"]);
+  assert.deepEqual([fake.calls.at(-1).body.doc_id, fake.calls.at(-1).body.form_id], ["123", "7"]);
 });
 
 // ---- the write-once rule through the whole stack: a 401 on the read-back must not reach the
@@ -201,7 +201,7 @@ test("server mode writes nothing but MCP frames to stdout", async () => {
   await client.connect(transport);
   try {
     assert.equal(client.getServerVersion().version, VERSION);
-    assert.equal((await client.listTools()).tools.length, 30);
+    assert.equal((await client.listTools()).tools.length, 32);
     const out = await client.callTool({ name: "alerts", arguments: {} });
     assert.equal(out.isError, true);
     assert.match(texts(out)[0][1], /^그룹웨어에 연결하지 못했습니다/);

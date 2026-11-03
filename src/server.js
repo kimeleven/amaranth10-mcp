@@ -1,4 +1,4 @@
-// The MCP server: 30 tools with their names, descriptions, annotations and parameters, each one
+// The MCP server: 32 tools with their names, descriptions, annotations and parameters, each one
 // call through a shared Groupware. stdout carries MCP only.
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -145,10 +145,20 @@ const TOOLS = [
     + "반복 일정과 자원·다른 참석자·첨부가 걸린 일정은 지우지 않는다. " + UNCLEAR],
   ["approval_list", READ_ONLY, read.fetchApprovals,
     { box: str("submitted"), start: orNone(z.string()), end: orNone(z.string()), page: int(1), count: int(20) },
-    "전자결재 문서 목록. box는 'submitted'(상신)·'draft'(임시보관)·'pending'(미결, 내가 결재할 문서).\n"
+    "전자결재 문서 목록. box는 'submitted'(상신)·'draft'(임시보관)·'pending'(미결, 내가 결재할 문서)·"
+    + "'reference'(수신참조, 나를 참조로 넣은 문서).\n"
     + "start/end는 'YYYY-MM-DD', 생략하면 올해. doc_id·form_id는 approval_read에 쓴다."],
   ["approval_read", OPENS, read.fetchApproval, { doc_id: strOrInt, form_id: strOrInt },
-    "전자결재 문서 상세: 결재선과 본문 텍스트. 미결 문서를 열면 기안자에게 열람으로 보일 수 있다."],
+    "전자결재 문서 상세: 결재선과 본문 텍스트. 미결·수신참조 문서를 열면 기안자에게 열람으로 보일 수 있다."],
+  ["drive_list", READ_ONLY, read.fetchDrive,
+    { folder: orNone(z.string()), query: str(""), page: int(1), count: int(30) },
+    "원챔버 드라이브의 폴더와 파일 목록. folder를 생략하면 내 드라이브와 전사문서함의 맨 위 폴더, 주면 그 폴더 안.\n"
+    + "query를 주면 그 아래(생략하면 두 곳 모두)에서 이름으로 찾는다. folder에는 목록의 uid(folder=true인 것)를 넣는다.\n"
+    + "page는 1부터, count는 한 번에 가져올 수(folder 생략 시 두 곳 각각). 파일 내용은 drive_read로 본다."],
+  ["drive_read", OPENS, read.readDriveFile, { uid: z.string() },
+    "원챔버 드라이브 파일을 받아 이 컴퓨터의 임시 폴더에 저장하고 경로(saved_to)를 돌려준다. uid는 drive_list의 파일 uid.\n"
+    + "txt·md·csv·json·xml·log 같은 UTF-8 텍스트 파일은 내용(text)도 함께 온다. PDF·HWP·오피스 문서는 내용을 풀지 않으니, "
+    + "파일을 읽을 수 있는 클라이언트면 saved_to를 열어 읽고, 아니면 사용자에게 경로를 알려 줄 것. 원챔버 웹 문서(.onex)는 받지 못할 수 있다."],
   ["leave_balance", READ_ONLY, read.fetchLeaveBalance, {}, "연차 잔여(일반·보상·대체)."],
   ["leave_requests", READ_ONLY, read.fetchLeaveRequests, { start: orNone(z.string()), end: orNone(z.string()) },
     "내 휴가 신청 목록: 종류(type)·기간·연차 사용 일수(days)·신청 시간(hours)·시각(time)·사유·결재 상태(status)·"
