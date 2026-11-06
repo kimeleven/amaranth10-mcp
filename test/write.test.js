@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 import { GroupwareError, SessionError } from "../src/client.js";
 import { cancelLeave, cancelReservation, createSchedule, deleteMail, deleteSchedule, fillBody, markMail, requestLeave,
-  reserveResource, sendMail, updateReservation, updateSchedule } from "../src/write.js";
+  requestTrip, reserveResource, sendMail, updateReservation, updateSchedule } from "../src/write.js";
 
 const S = { base: "https://gw.example.com", token: "G1|E1|R1", signKey: "test-sign-key",
   user: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", empSeq: "E1", email: "hong@example.com", erpCoCd: "1000",
@@ -614,9 +614,18 @@ test("mail mark: unread by default, read when asked, in the mail's folder", asyn
 
 // ---- leave_request
 const CODES = [
-  { atCd: "1101", atNm: "연차", linkAtCd: "1010", timeSetFg: "ALL", outProcessId: "HP_HPD0110_00011" },
-  { atCd: "1111", atNm: "반반차", linkAtCd: "1010", timeSetFg: "NA", outProcessId: "HP_HPD0110_00011" },
-  { atCd: "1302", atNm: "기타휴가", linkAtCd: "1030", timeSetFg: "NA", outProcessId: "HP_HPD0110_00013" }];
+  { atCd: "1101", atNm: "연차", linkAtCd: "1010", atPopupCd: "10", timeSetFg: "ALL", exycCnt: 1, outProcessId: "HP_HPD0110_00011" },
+  { atCd: "1111", atNm: "반반차", linkAtCd: "1010", atPopupCd: "10", timeSetFg: "NA", exycCnt: 0.25, outProcessId: "HP_HPD0110_00011" },
+  { atCd: "1302", atNm: "기타휴가", linkAtCd: "1030", atPopupCd: "10", timeSetFg: "NA", exycCnt: 0, outProcessId: "HP_HPD0110_00013" },
+  // never offered: 경조휴가 asks for the relative's name and resident number, and this 병가 for the company's own checks
+  { atCd: "1201", atNm: "경조휴가", linkAtCd: "1020", atPopupCd: "10", timeSetFg: "ALL", exycCnt: 0, outProcessId: "HP_HPD0110_00012" },
+  { atCd: "1502", atNm: "병가", linkAtCd: "1080", atPopupCd: "10", timeSetFg: "ALL", exycCnt: 0, outProcessId: "HP_HPD0110_00015" },
+  { atCd: "2102", atNm: "시내출장", linkAtCd: "2020", atPopupCd: "20", timeSetFg: "ALL", exycCnt: 0, outProcessId: "HP_HPD0110_00021" },
+  { atCd: "5102", atNm: "연장근무", linkAtCd: "5020", atPopupCd: "50", timeSetFg: "OT", exycCnt: 0, outProcessId: "HP_HPD0110_00051" }];
+const BASE = { attendCodeList: CODES,
+  formSettingList: [{ atPopupCd: "10", linkAtCd: "1030", appItem: "APP_REASON_DC" }, { atPopupCd: "10", linkAtCd: "1020", appItem: "CON_FG" }],
+  attendValidationList: [{ linkAtCd: "1080", ctrTp: "7", ctVal: "1502" }, { linkAtCd: "1030", ctrTp: "7", ctVal: "" }],
+  transportationList: [{ ctdCd: "11", ctdNm: "기차", dummy1: "03" }, { ctdCd: "15", ctdNm: "자가용", dummy1: "05" }] };
 const span = (a, b = a) => ({ atDt: a, startDt: a, endDt: b, startTm: "0900", endTm: "1800", appDy: "1", appTm: 480, ycUseCnt: 1 });
 const BIND = JSON.stringify({ ITEMS: { appYear: "2026" },
   TABLE: { dbTable1: { group: [{ items: { empNm: "홍길동" }, group: [{ items: { atCdNm: "연차", appRmkDc: "<가족 여행>" } }] }] } } });
@@ -630,20 +639,28 @@ const SUBMIT = ["create", "GetLinkKey", "SetEnageGroup", "saveLinkKey", "eap110A
 const SAVED = [{ appLineId: 233, appLineNm: "[개인]휴가" }, { appLineId: 300, appLineNm: "나만" }];
 
 // drafted: the line the document's own draft comes back with
-function leaveApi({ spans = [span("20261216")], lines = SAVED, drafted = LINE, fail = {} } = {}) {
+// days: the work days a trip's period holds
+// used: the 연차 a request takes; title: the company's own title for it
+function leaveApi({ spans = [span("20261216")], days = ["20261216", "20261217"], lines = SAVED, drafted = LINE, fail = {}, used = 1,
+  title = "[개발팀 홍길동] 12-16 연차신청서" } = {}) {
   return fake((path, body) => {
     const name = path.split("/").pop();
     if (fail[name]) return fail[name](body);
     switch (name) {
-      case "getApplicationBaseInfo": return { attendCodeList: CODES,
+      case "getApplicationBaseInfo": return { ...BASE,
         employee: { coCd: "1000", empCd: "123", deptCd: "D10", korNm: "홍길동", rsrgNo: "RRN-SECRET", brthDt: "BIRTH-SECRET" } };
       case "getStartTmEndTmByWorkType": return { startTm: "0900", endTm: "1800", workTp: "1" };
-      case "calculateApplicationDays": return { deptNm: "개발팀", empNm: "홍길동", ycUseCnt: spans.length ? 1 : 0, applicationDaysCnt: 1,
+      case "calculateApplicationDays": return { deptNm: "개발팀", empNm: "홍길동", ycUseCnt: spans.length ? used : 0, applicationDaysCnt: 1,
         applicationMinutes: 480, dailyAppTm: 480, dailyCalculatedTimeYcUseCnt: 1, holidayExclusionApplicationList: spans };
+      case "convertPeriodToDailyList": return days.map((atDt) => ({ atCd: body.atCd, linkAtCd: body.linkAtCd, atDt,
+        startDt: body.startDt, endDt: body.endDt, startTm: body.startTm, endTm: body.endTm, appDy: "1", appTm: 480,
+        biztrDc: body.biztrDc, biztrPpsDc: body.biztrPpsDc, taskDc: body.taskDc, trafFg: body.trafFg, moveFg: body.moveFg }));
       case "validateNew": return { duplicateSubmittedApplicationDetails: [], insufficientAnnualLeaveList: [] };
-      case "0hr00011": return "[개발팀 홍길동] 12-16 연차신청서";
+      case "0hr00011": return title;
       case "eap096A45": return [{ formDTp: "HP_HPD0110_00012", formId: 2037 },
-        { formDTp: "HP_HPD0110_00011", formId: 2036, formNm: "연차휴가신청서" }];
+        { formDTp: "HP_HPD0110_00011", formId: 2036, formNm: "연차휴가신청서" },
+        { formDTp: "HP_HPD0110_00013", formId: 2038, formNm: "기타휴가신청서" },
+        { formDTp: "HP_HPD0110_00021", formId: 2040, formNm: "출장신청서" }];
       case "getAnnualLeaveInfoOfEmployee": return { unusedCnt: 10 };
       case "eap096A48": return lines;
       case "create": return { appSq: 501, coCd: "1000", appDt: "20261028" };
@@ -653,7 +670,7 @@ function leaveApi({ spans = [span("20261216")], lines = SAVED, drafted = LINE, f
         oauth_token: "TOKEN-SECRET" }, resultMap: {
         hidAppDocLine: body.approkey ? drafted : body.appLineId === "300" ? [LINE[0]] : LINE,
         hidRefer: [{ div: "d", org_id: "D20", dept_nm: "인사팀" }],
-        outProcessForm: { outBindData: BIND }, docnumtype: [{ cd_val: "1001" }], getFormData: [{ form_id: 2036 }] } };
+        outProcessForm: { outBindData: BIND }, docnumtype: [{ cd_val: "1001" }], getFormData: [{ form_id: body.formID }] } };
       case "eap110A06": return { result: 1004400 };
       // the same appSq under another application date is a different application
       case "at00001": return [{ appSq: 501, appDt: "20260101", approState: "5" }, { appSq: 501, appDt: "20261028", approState: "0" }];
@@ -687,10 +704,37 @@ test("leave request: 반반차 is two hours from start_time", async () => {
   }
 });
 
+test("leave request: 기타휴가 runs from start_time to end_time on its own form, and no 연차 is counted", async () => {
+  // the company's title rule prints the 연차 count even when none is used: that part goes
+  const titled = { used: 0, title: "[개발팀 홍길동] 12-16 (13:00~18:00)(0개)기타휴가신청서" };
+  const api = leaveApi(titled);
+  assert.deepEqual(await leave(api, { kind: "기타휴가", start_time: "13:00", end_time: "18:00", reason: "병원" }), {
+    kind: "기타휴가", start: "2026-12-16", end: "2026-12-16", time: "13:00~18:00", title: "[개발팀 홍길동] 12-16 (13:00~18:00)기타휴가신청서",
+    reason: "병원", approval_line: PREVIEW.approval_line });
+  const calc = bodyOf(api, "calculateApplicationDays");
+  assert.deepEqual([calc.atCd, calc.linkAtCd, calc.startTime, calc.endTime], ["1302", "1030", "1300", "1800"]);
+  assert.equal(bodyOf(api, "validateNew").newItem.linkAtCd, "1030");
+  assert.equal(bodyOf(api, "eap096A48").formId, 2038);
+  assert.ok(!api.paths().some((p) => p.endsWith("getAnnualLeaveInfoOfEmployee")));
+  for (const [start_time, end_time] of [["13:00", null], ["13:00", "12:00"], ["13:00", "25:00"], [null, "18:00"]]) {
+    await assert.rejects(leave(leaveApi(), { kind: "기타휴가", start_time, end_time }), rejectsWith(/start_time.*end_time/));
+  }
+  const sent = leaveApi(titled);
+  assert.equal((await leave(sent, { kind: "기타휴가", start_time: "13:00", end_time: "18:00", confirm: true })).link,
+    "https://gw.example.com/#/popup?MicroModuleCode=eap&callComp=UBAP002&docID=1004400&formId=2038&docAuth=0");
+  assert.deepEqual([bodyOf(sent, "create").titleDc, bodyOf(sent, "SetEnageGroup").docTitle, bodyOf(sent, "eap110A06").paramItem.doc_title],
+    Array(3).fill("[개발팀 홍길동] 12-16 (13:00~18:00)기타휴가신청서"));
+  // 연차 keeps its count
+  assert.equal((await leave(leaveApi({ title: "[개발팀 홍길동] 12-16 (09:00~18:00)(1개)연차신청서" }))).title,
+    "[개발팀 홍길동] 12-16 (09:00~18:00)(1개)연차신청서");
+});
+
 test("leave request: what it cannot ask for stops before any write", () => {
   const validate = (resultCode, resultMsg) => ({ fail: { validateNew: () => new Response(JSON.stringify({ resultCode, resultMsg })) } });
   return refuses(leaveApi, leave, [
-    [{ kind: "기타휴가" }, {}, /kind는 연차·반반차 중 하나/],
+    [{ kind: "경조휴가" }, {}, /kind는 연차·반반차·기타휴가 중 하나/],
+    [{ kind: "병가" }, {}, /kind는 연차·반반차·기타휴가 중 하나/],
+    [{ kind: "시내출장" }, {}, /kind는 연차·반반차·기타휴가 중 하나/],
     [{ start: "2026-12-22", end: "2026-12-18" }, {}, /시작일\(2026-12-22\)이 종료일/],
     [{}, { spans: [] }, /근무일이 없습니다/],
     [{ end: "2026-12-22" }, { spans: [span("20261218"), span("20261221", "20261222")] }, /2026-12-18, 2026-12-21~2026-12-22로 나눠/],
@@ -783,7 +827,7 @@ test("leave request with a form: an unchanged accept submits what the form showe
   assert.match(message, /^연차 2026-12-16 09:00~18:00\n연차 1일 사용, 신청 후 남는 연차 9일\n제목: .*\n사유: 가족 여행\n결재라인: \[개인\]휴가: 홍길동\(결재\) → 김팀장\(결재\), 참조 인사팀\n\n값을 바꾸지 않고 승인하면 바로 상신/);
   assert.deepEqual(schema.required, ["kind", "start", "approval_line"]);
   assert.deepEqual([schema.properties.kind.enum, schema.properties.kind.default, schema.properties.start.default],
-    [["연차", "반반차"], "연차", "2026-12-16"]);
+    [["연차", "반반차", "기타휴가"], "연차", "2026-12-16"]);
   assert.deepEqual(schema.properties.approval_line, { type: "string", title: "결재라인", default: "233",
     oneOf: [{ const: "233", title: "[개인]휴가: 홍길동(결재) → 김팀장(결재), 참조 인사팀" }] });
   assert.deepEqual(writes(api), SUBMIT);
@@ -813,15 +857,96 @@ test("leave request with a form: a declined form submits nothing, and confirm=tr
   await assert.rejects(leave(leaveApi({ lines: [SAVED[1]] }), {}, formOf().ask), rejectsWith(/본인 외 결재자가 있는/));
 });
 
-test("fillBody fills every field and stops at one without a value", () => {
+// ---- trip_request
+const TRIP = { kind: "시내출장", start: "2026-12-16", end: "2026-12-17", place: "고객사", purpose: "설치 지원", task: "장비 점검",
+  transport: "기차", approval_line: "[개인]휴가" };
+const trip = (api, args = {}, ask = null) => requestTrip(S, { ...TRIP, ...args }, { fetch: api.fetch, now: NOW, ask });
+const TRIP_PREVIEW = { kind: "시내출장", start: "2026-12-16", end: "2026-12-17", days: 2, time: "09:00~18:00", place: "고객사",
+  purpose: "설치 지원", task: "장비 점검", transport: "기차", title: PREVIEW.title, approval_line: PREVIEW.approval_line };
+const TRIP_FIELDS = { biztrDc: "고객사", biztrPpsDc: "설치 지원", taskDc: "장비 점검", trafFg: "11", moveFg: "03", driverCd: "",
+  biztrCommuteTp: "FIELD_BOTH" };
+
+test("trip request: a preview reads only, and every work day is a row carrying the trip", async () => {
+  const api = leaveApi();
+  assert.deepEqual(await trip(api), TRIP_PREVIEW);
+  assert.deepEqual(writes(api), []);
+  const daily = bodyOf(api, "convertPeriodToDailyList"), item = bodyOf(api, "validateNew").newItem;
+  assert.deepEqual([daily.atCd, daily.linkAtCd, daily.startDt, daily.endDt, daily.startTm, daily.endTm],
+    ["2102", "2020", "20261216", "20261217", "0900", "1800"]);
+  for (const body of [daily, item]) assert.deepEqual(Object.fromEntries(Object.keys(TRIP_FIELDS).map((k) => [k, body[k]])), TRIP_FIELDS);
+  assert.equal(bodyOf(api, "eap096A45").body.formDTp, "HP_HPD0110_00021");
+  assert.equal(bodyOf(api, "eap096A48").formId, 2040);
+  // no transport: none sent
+  const plain = leaveApi();
+  assert.equal((await trip(plain, { transport: null, task: null })).transport, "");
+  assert.deepEqual([bodyOf(plain, "convertPeriodToDailyList").trafFg, bodyOf(plain, "convertPeriodToDailyList").moveFg,
+    bodyOf(plain, "convertPeriodToDailyList").taskDc], ["", "", ""]);
+});
+
+test("trip request: what it cannot ask for stops before any write", () => refuses(leaveApi, trip, [
+  [{ kind: "연차" }, {}, /kind는 시내출장 중 하나/],
+  [{ place: " " }, {}, /place\(방문처\)/],
+  [{ purpose: null }, {}, /purpose\(출장목적\)/],
+  [{ transport: "우주선" }, {}, /transport는 기차·자가용 중 하나/],
+  [{ start: "2026-12-18", end: "2026-12-17" }, {}, /시작일\(2026-12-18\)이 종료일/],
+  [{}, { days: [] }, /근무일이 없습니다/],
+  [{ start: "2026-12-15" }, {}, /시작일과 종료일은 휴일/],
+  [{ end: "2026-12-19" }, {}, /시작일과 종료일은 휴일/],
+  [{ approval_line: "나만" }, {}, /approval_line은 저장된 결재라인/]]));
+
+test("trip request: confirm saves every day's row, links and submits once each", async () => {
+  const api = leaveApi();
+  assert.deepEqual(await trip(api, { confirm: true }), { ...TRIP_PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400",
+    status: "결재진행", link: "https://gw.example.com/#/popup?MicroModuleCode=eap&callComp=UBAP002&docID=1004400&formId=2040&docAuth=0" });
+  assert.deepEqual(writes(api), SUBMIT);
+  assert.deepEqual(bodyOf(api, "create").applicationList.map((r) => [r.atDt, r.biztrDc, r.coCd, r.empCd, r.deptCd, r.deptNm, r.empNm]),
+    [["20261216", "고객사", "1000", "123", "D10", "개발팀", "홍길동"], ["20261217", "고객사", "1000", "123", "D10", "개발팀", "홍길동"]]);
+  assert.deepEqual([bodyOf(api, "SetEnageGroup").formDTp, bodyOf(api, "SetEnageGroup").formId], ["HP_HPD0110_00021", 2040]);
+  assert.ok(!/SECRET/.test(JSON.stringify(api.calls)));
+});
+
+test("trip request with a form: the trip's fields are asked, and an unchanged accept submits", async () => {
+  const api = leaveApi(), form = formOf({ ...TRIP, approval_line: "233" });
+  assert.equal((await trip(api, {}, form.ask)).submitted, true);
+  const [{ message, requestedSchema: schema }] = form.asked;
+  assert.match(message, /^시내출장 2026-12-16~2026-12-17 09:00~18:00 \(2일\)\n방문처: 고객사\n출장목적: 설치 지원\n업무내용: 장비 점검\n교통수단: 기차\n제목: .*\n결재라인: .*\n\n값을 바꾸지 않고 승인하면 바로 상신/);
+  assert.deepEqual(schema.required, ["kind", "start", "place", "purpose", "approval_line"]);
+  assert.deepEqual([schema.properties.kind.enum, schema.properties.transport.enum, schema.properties.place.default],
+    [["시내출장"], ["기차", "자가용"], "고객사"]);
+  assert.deepEqual(writes(api), SUBMIT);
+  const empty = leaveApi(), twice = formOf({ ...TRIP, approval_line: "233" }, { ...TRIP, approval_line: "233" });
+  assert.equal((await requestTrip(S, {}, { fetch: empty.fetch, now: NOW, ask: twice.ask })).submitted, true);
+  assert.equal(twice.asked[0].message.split("\n")[0], "출장 신청 내용을 입력해 주세요.");
+});
+
+test("fillBody repeats a table's row once per row of a group, each with its own values", () => {
+  const main = '<meta charset="utf-8"><style>* {margin:0;}</style><p><input mapping_key="atDt"></p>'
+    + '<table mapping_key="dbTable1"><tr><th>출장일</th></tr><tr><td><input mapping_key="atDt"></td>'
+    + '<td><input mapping_key="empNm"></td></tr></table><p><input mapping_key="appYear"></p>';
+  const bind = JSON.stringify({ ITEMS: { appYear: "2026", atDt: "12-16~12-17" }, TABLE: { dbTable1: { group: [{ items: { empNm: "홍길동" },
+    group: [{ items: { atDt: "12-16" } }, { items: { atDt: "<12-17>" } }] }] } } });
+  assert.match(fillBody(main, bind), /<p>12-16~12-17<\/p><table mapping_key="dbTable1"><tr><th>출장일<\/th><\/tr><tr><td>12-16<\/td><td>홍길동<\/td><\/tr><tr><td>&lt;12-17&gt;<\/td><td>홍길동<\/td><\/tr><\/table><p>2026<\/p><\/body>$/);
+  // a form that opens with a paragraph: a browser puts it, the meta and the style all in the body
+  assert.equal(fillBody('<p><br></p><meta charset="utf-8"><style>* {margin:0;}</style><p><input mapping_key="appYear"></p>', BIND),
+    '<head></head><body><p><br></p><meta charset="utf-8"><style>* {margin:0;}</style><p>2026</p></body>');
+  const lost = JSON.stringify({ TABLE: { dbTable1: { group: [{ items: { listNum: "1" } }, { items: { listNum: "2" } }] } } });
+  assert.throws(() => fillBody(main, lost), rejectsWith(/결재 본문의 표/));
+  assert.match(fillBody(MAIN, JSON.stringify({ ITEMS: { appYear: "2026" }, TABLE: { dbTable1: { group: [{ items: { empNm: "홍길동",
+    atCdNm: "연차", appRmkDc: "" }, group: null }] } } })), /<p>2026년 홍길동 연차 <\/p>/);
+});
+
+test("fillBody fills every field, keeps the form's own text where the data has none, and stops where it has neither", () => {
   assert.match(fillBody(MAIN, BIND), /<p>2026년 홍길동 연차 &lt;가족 여행&gt;<\/p><\/body>$/);
+  // as the editor leaves it (live 2026-11-06: 기타휴가's 순번 in 1pt)
+  assert.match(fillBody(`${MAIN}<input style="font-size:1pt;" mapping_key="listNum" value="순번"><input mapping_key="x" value="칸">`, BIND),
+    /<\/p><span style="font-size:1pt;">순번<\/span>칸<\/body>$/);
   assert.throws(() => fillBody(`${MAIN}<input mapping_key="usedCnt">`, BIND), rejectsWith(/usedCnt/));
 });
 
 // ---- leave_cancel
 const INFO = { attendApplicationMaster: { appSq: "501", appEmpCd: "123", titleDc: "연차신청서" },
   attendApplicationDetailList: [{ atDt: "20261216" }] };
-const LEAVE_ROW = { appSq: "501", appDt: "20261028", linkAtCd: "1010", atNm: "연차", approState: "0", idDoc: "1004400" };
+const LEAVE_ROW = { appSq: "501", appDt: "20261028", atCd: "1101", linkAtCd: "1010", atNm: "연차", approState: "0", idDoc: "1004400" };
 const ME_STEP = { empSeq: "E1", userNm: "홍길동", appDt: "2026-10-28 09:30" }, BOSS_STEP = { empSeq: "E9", userNm: "김팀장", appDt: "" };
 const DOC = { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "10" };
 
@@ -830,6 +955,7 @@ function withdrawApi({ row = LEAVE_ROW, rows = null, info = INFO, a98 = { doc_st
   let done = false;
   return fake((path) => {
     const name = path.split("/").pop();
+    if (name === "getApplicationBaseInfo") return BASE;
     if (name === "selectAttendApplicationInfo") return info;
     if (name === "at00001") return done ? back() : rows || [row];
     if (name === "eap110A98") return a98;
@@ -862,7 +988,8 @@ test("leave cancel: refused before any write", () => refuses(withdrawApi, cancel
   [{ id: "501" }, {}, /leave_requests의 id/],
   [{}, { info: { attendApplicationMaster: {}, attendApplicationDetailList: [] } }, /찾을 수 없습니다/],
   [{}, { info: { ...INFO, attendApplicationMaster: { ...INFO.attendApplicationMaster, appEmpCd: "999" } } }, /본인이 신청한/],
-  [{}, { row: { ...LEAVE_ROW, linkAtCd: "1030" } }, /연차·반차·반반차 신청만/],
+  [{}, { row: { ...LEAVE_ROW, atCd: "5102", linkAtCd: "5020" } }, /leave_request·trip_request로 신청하는 휴가·출장만/],
+  [{}, { row: { ...LEAVE_ROW, atCd: "1201", linkAtCd: "1020" } }, /leave_request·trip_request로 신청하는 휴가·출장만/],
   [{}, { row: { ...LEAVE_ROW, approState: "1" } }, /결재가 끝난 신청은 그룹웨어/],
   [{}, { row: { ...LEAVE_ROW, approState: "4" } }, /결재반려 상태의 신청은 취소할 수 없습니다/],
   [{}, { row: { ...LEAVE_ROW, idDoc: null } }, /결재 문서 번호/],
@@ -917,17 +1044,20 @@ test("leave cancel: once withdrawn, a failed delete says where the document is a
 
 test("leave cancel with a form: the person picks among what can still be canceled, and the pick cancels it", async () => {
   const row = { ...LEAVE_ROW, startDt: "20261216", endDt: "20261216", appRmkDc: "가족 여행" };
-  const rows = [row, { ...row, atDt: "20261217" }, { ...row, appSq: "502", approState: "1" }, { ...row, appSq: "503", linkAtCd: "1030" },
-    { ...row, appSq: "504", reportCancYn: "Y" }, { ...row, appSq: "505", approState: "2", startDt: "20261218", endDt: "20261219", appRmkDc: "" }];
+  const rows = [row, { ...row, atDt: "20261217" }, { ...row, appSq: "502", approState: "1" },
+    { ...row, appSq: "503", atCd: "5102", linkAtCd: "5020", atNm: "연장근무" }, { ...row, appSq: "504", reportCancYn: "Y" },
+    { ...row, appSq: "505", approState: "2", startDt: "20261218", endDt: "20261219", appRmkDc: "" },
+    { ...row, appSq: "506", atCd: "2102", linkAtCd: "2020", atNm: "시내출장", startDt: "20261221", endDt: "20261221", appRmkDc: "" }];
   const viaForm = (api, args, form) => cancelLeave(S, args, { fetch: api.fetch, now: () => new Date(2026, 9, 29), ask: form.ask });
   const api = withdrawApi({ rows }), form = formOf({ id: "20261028-501" });
   assert.equal((await viaForm(api, {}, form)).canceled, true);
   assert.deepEqual([bodyOf(api, "at00001").startDate, bodyOf(api, "at00001").endDate], ["20260101", "20271231"]);
   const [{ message, requestedSchema }] = form.asked;
-  assert.match(message, /^취소할 연차 신청을 고르세요\. 승인하면 바로 취소되며 되돌릴 수 없습니다/);
+  assert.match(message, /^취소할 휴가·출장 신청을 고르세요\. 승인하면 바로 취소되며 되돌릴 수 없습니다/);
   assert.deepEqual(requestedSchema.properties.id, { type: "string", title: "신청", oneOf: [
     { const: "20261028-501", title: "2026-12-16 연차 (결재진행) 가족 여행" },
-    { const: "20261028-505", title: "2026-12-18~2026-12-19 연차 (상신대기)" }] });
+    { const: "20261028-505", title: "2026-12-18~2026-12-19 연차 (상신대기)" },
+    { const: "20261028-506", title: "2026-12-21 시내출장 (결재진행)" }] });
   assert.deepEqual(writes(api), ["eap110A20", "eap107A25"]);
 
   const declined = withdrawApi({ rows }), no = formOf("decline");
@@ -937,7 +1067,7 @@ test("leave cancel with a form: the person picks among what can still be cancele
 
   // nothing cancelable: no form; an id that cannot be canceled says why, before any form
   const none = formOf();
-  assert.match((await viaForm(withdrawApi({ rows: [rows[2]] }), {}, none)).note, /취소할 수 있는 연차 신청이 없습니다/);
+  assert.match((await viaForm(withdrawApi({ rows: [rows[2], rows[3]] }), {}, none)).note, /취소할 수 있는 휴가·출장 신청이 없습니다/);
   await assert.rejects(viaForm(withdrawApi({ row: { ...row, approState: "1" } }), { id: "20261028-501" }, none),
     rejectsWith(/결재가 끝난 신청은/));
   assert.equal(none.asked.length, 0);
@@ -947,7 +1077,7 @@ test("leave cancel with a form: the person picks among what can still be cancele
 test("every write tool only previews unless confirm is exactly true", async () => {
   const tools = [[resApi, reserve], [cancelApi, cancel], [updateApi, (api, a) => resUpdate(api, { title: "새 제목", ...a })],
     [schApi, create], [schApi, (api, a) => update(api, { title: "t", ...a })], [schApi, remove], [mailApi, sendTo],
-    [mailApi, delMail], [leaveApi, leave], [withdrawApi, cancelOf]];
+    [mailApi, delMail], [leaveApi, leave], [leaveApi, trip], [withdrawApi, cancelOf]];
   for (const confirm of [undefined, false, "true", 1, "yes"]) {
     for (const [makeApi, call] of tools) {
       const api = makeApi();

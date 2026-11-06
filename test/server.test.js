@@ -168,8 +168,12 @@ test("a write without confirm=true, missing or misspelled, previews and says not
 });
 
 test("the leave tools ask through a form only when the client can show one, and its pick needs no confirm", async () => {
-  const ROW = { appSq: "501", appDt: "20261028", linkAtCd: "1010", atNm: "연차", approState: "2", startDt: "20261216", endDt: "20261216" };
+  const ROW = { appSq: "501", appDt: "20261028", atCd: "1101", linkAtCd: "1010", atNm: "연차", approState: "2", startDt: "20261216",
+    endDt: "20261216" };
   const fake = fakeGroupware((path, calls) => {
+    if (path.endsWith("getApplicationBaseInfo")) {
+      return { attendCodeList: [{ atCd: "1101", atNm: "연차", linkAtCd: "1010", atPopupCd: "10", outProcessId: "HP_HPD0110_00011" }] };
+    }
     if (path.endsWith("selectAttendApplicationInfo")) {
       return { attendApplicationMaster: { appSq: "501", appEmpCd: "12345" }, attendApplicationDetailList: [{ atDt: "20261216" }] };
     }
@@ -201,7 +205,7 @@ test("server mode writes nothing but MCP frames to stdout", async () => {
   await client.connect(transport);
   try {
     assert.equal(client.getServerVersion().version, VERSION);
-    assert.equal((await client.listTools()).tools.length, 32);
+    assert.equal((await client.listTools()).tools.length, 33);
     const out = await client.callTool({ name: "alerts", arguments: {} });
     assert.equal(out.isError, true);
     assert.match(texts(out)[0][1], /^그룹웨어에 연결하지 못했습니다/);

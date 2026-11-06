@@ -1,4 +1,4 @@
-// The MCP server: 32 tools with their names, descriptions, annotations and parameters, each one
+// The MCP server: 33 tools with their names, descriptions, annotations and parameters, each one
 // call through a shared Groupware. stdout carries MCP only.
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -161,28 +161,43 @@ const TOOLS = [
     + "파일을 읽을 수 있는 클라이언트면 saved_to를 열어 읽고, 아니면 사용자에게 경로를 알려 줄 것. 원챔버 웹 문서(.onex)는 받지 못할 수 있다."],
   ["leave_balance", READ_ONLY, read.fetchLeaveBalance, {}, "연차 잔여(일반·보상·대체)."],
   ["leave_requests", READ_ONLY, read.fetchLeaveRequests, { start: orNone(z.string()), end: orNone(z.string()) },
-    "내 휴가 신청 목록: 종류(type)·기간·연차 사용 일수(days)·신청 시간(hours)·시각(time)·사유·결재 상태(status)·"
+    "내 휴가·출장 신청 목록: 종류(type)·기간·연차 사용 일수(days)·신청 시간(hours)·시각(time)·사유·결재 상태(status)·"
     + "취소 여부(canceled). days는 연차에서 빠지는 일수라 기타휴가·출장은 0이고, 반차·시간 단위 신청은 hours와 time으로 본다. "
     + "출장 등 다른 근태 신청도 함께 오며 type으로 구분한다.\n"
     + "start/end는 'YYYY-MM-DD', 생략하면 올해. doc_id는 전자결재 문서 ID라서, approval_list에서\n"
     + "같은 doc_id의 form_id를 찾아 approval_read로 연다. id는 신청 건이며 leave_cancel에 쓴다. 남은 연차는 leave_balance."],
   ["leave_request", WRITES, write.requestLeave,
     { kind: orNone(z.string()), start: orNone(z.string()), end: orNone(z.string()), reason: str(""),
-      start_time: orNone(z.string()), approval_line: orNone(z.string()), confirm: flag },
-    "연차·반차 신청서를 전자결재로 상신. kind는 연차·오전반차·오후반차·반반차(회사 설정의 이름). start/end는 'YYYY-MM-DD'"
-    + "(end 생략 시 하루). 반반차는 start_time('HH:MM')부터 2시간. 주말·휴일로 나뉘는 기간은 구간마다 따로 신청한다.\n"
+      start_time: orNone(z.string()), end_time: orNone(z.string()), approval_line: orNone(z.string()), confirm: flag },
+    "휴가 신청서를 전자결재로 상신. kind는 연차·오전반차·오후반차·반반차와 기타휴가·무급휴가·병가 등 사유만 적는 휴가"
+    + "(회사 설정의 이름, 틀리면 가능한 이름을 알려 준다). 경조휴가·출산·육아휴직은 신청하지 않는다. start/end는 'YYYY-MM-DD'"
+    + "(end 생략 시 하루). 반반차는 start_time('HH:MM')부터 2시간, 기타휴가처럼 시간을 정하는 휴가는 start_time~end_time"
+    + "('HH:MM'). 주말·휴일로 나뉘는 기간은 구간마다 따로 신청한다. 출장은 trip_request.\n"
     + "approval_line은 그룹웨어에 저장된 결재라인의 이름이며 사용자가 고른다. 본인 외 결재자가 없는 결재라인으로는 상신하지 않는다.\n"
     + "입력 폼을 띄울 수 있는 클라이언트에서는 사용자가 폼에서 모든 값을 확인·수정하고 미리보기를 본 뒤 승인해야 상신된다"
-    + "(아는 값만 넘기면 폼에 채워지고, confirm은 쓰지 않는다). 폼이 없으면 confirm=false(기본)로 미리보기(시각·차감 일수·"
-    + "남는 연차·제목·결재라인)를 받아 사용자에게 보여 주고, 확인받은 뒤에만 confirm=true로 다시 부른다.\n"
+    + "(아는 값만 넘기면 폼에 채워지고, confirm은 쓰지 않는다). 폼이 없으면 confirm=false(기본)로 미리보기(시각·연차면 "
+    + "차감 일수와 남는 연차·제목·결재라인)를 받아 사용자에게 보여 주고, 확인받은 뒤에만 confirm=true로 다시 부른다.\n"
     + "상신하면 결재자에게 알림이 간다. 실패해도 다시 시도하지 않는다. 그룹웨어에 신청 수정이 없어서, 바꾸려면 "
     + "leave_cancel로 취소한 뒤 다시 신청한다. " + LINK],
   ["leave_cancel", WRITES, write.cancelLeave, { id: orNone(z.string()), confirm: flag },
-    "결재가 끝나지 않은 연차·반차 신청을 취소. 결재진행 중이고 아무도 처리하지 않았으면 회수한 뒤 삭제하고, 임시보관이면 "
-    + "삭제하고, 상신대기(결재 문서 없음)면 신청을 지운다. 되돌릴 수 없다. 결재가 끝난 신청은 그룹웨어에서 결재취소해야 한다.\n"
+    "결재가 끝나지 않은 휴가·출장 신청(leave_request·trip_request로 신청하는 종류)을 취소. 결재진행 중이고 아무도 "
+    + "처리하지 않았으면 회수한 뒤 삭제하고, 임시보관이면 삭제하고, 상신대기(결재 문서 없음)면 신청을 지운다. 되돌릴 수 없다. 결재가 끝난 신청은 그룹웨어에서 결재취소해야 한다.\n"
     + "입력 폼을 띄울 수 있는 클라이언트에서는 id 없이 불러도 되며, 사용자가 폼에서 취소할 신청을 고르고 승인하면 바로 취소된다"
     + "(confirm은 쓰지 않는다). 폼이 없으면 id(leave_requests의 id)를 넣어 confirm=false로 미리보기를 받고, 사용자 확인 뒤 "
     + "confirm=true로 실행한다."],
+  ["trip_request", WRITES, write.requestTrip,
+    { kind: orNone(z.string()), start: orNone(z.string()), end: orNone(z.string()), place: orNone(z.string()),
+      purpose: orNone(z.string()), task: str(""), transport: orNone(z.string()), approval_line: orNone(z.string()), confirm: flag },
+    "출장 신청서를 전자결재로 상신. kind는 시내출장·시외출장·해외출장(회사 설정의 이름, 틀리면 가능한 이름을 알려 준다). "
+    + "start/end는 'YYYY-MM-DD'(end 생략 시 하루)이며 기간 안의 근무일마다 근무시간 전체로 신청하고, 시작일·종료일이 휴일이면 "
+    + "신청하지 않는다. place는 방문처, purpose는 출장목적(둘 다 필수), task는 업무내용, transport는 교통수단(기차·고속버스·"
+    + "자가용·기타 교통수단 등 회사 설정의 이름).\n"
+    + "approval_line은 그룹웨어에 출장신청서용으로 저장된 결재라인의 이름이며 사용자가 고른다. 본인 외 결재자가 없는 결재라인으로는 "
+    + "상신하지 않는다.\n"
+    + "입력 폼을 띄울 수 있는 클라이언트에서는 사용자가 폼에서 모든 값을 확인·수정하고 미리보기를 본 뒤 승인해야 상신된다"
+    + "(아는 값만 넘기면 폼에 채워지고, confirm은 쓰지 않는다). 폼이 없으면 confirm=false(기본)로 미리보기(출장일수·시각·"
+    + "제목·결재라인)를 받아 사용자에게 보여 주고, 확인받은 뒤에만 confirm=true로 다시 부른다.\n"
+    + "상신하면 결재자에게 알림이 간다. 실패해도 다시 시도하지 않는다. 바꾸려면 leave_cancel로 취소한 뒤 다시 신청한다. " + LINK],
 ];
 
 // a list is one text block per item ("[]" when empty: no content reads as a failure), anything else
@@ -194,7 +209,7 @@ const block = (x) => ({ type: "text", text: typeof x === "string" ? x : JSON.str
 const NOT_YET = "미리보기만 했고 아직 실행하지 않았습니다. 사용자가 승인하면 같은 인자에 confirm=true를 더해 다시 호출하세요.";
 
 // the tools that ask the person through a form (MCP elicitation) when the client can show one
-const ASKS = new Set([write.requestLeave, write.cancelLeave]);
+const ASKS = new Set([write.requestLeave, write.requestTrip, write.cancelLeave]);
 
 export function createServer(gw) {
   const server = new McpServer({ name: "amaranth10", version: VERSION });

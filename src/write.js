@@ -1,4 +1,4 @@
-// Resource, schedule, mail and leave writes: a preview unless args.confirm is exactly true, write calls that
+// Resource, schedule, mail, leave and trip writes: a preview unless args.confirm is exactly true, write calls that
 // are never retried, a read-back, and a result it cannot confirm says to check the groupware instead
 // of inviting another try.
 import { randomUUID } from "node:crypto";
@@ -447,23 +447,34 @@ export async function markMail(session, { muids, box = "INBOX", read = false } =
   return { box: name, muids: uids, unread: read !== true };
 }
 
-// ---- leave
-// 연차 and its half and quarter days (linkAtCd 1010: one form, one balance). A request is saved, linked to an
-// e-approval document and submitted in one approved call, as the web client does it (captured 2026-10-28); a
-// cancel withdraws and deletes a document no one has acted on yet. No edit: the groupware has none either.
-const LEAVE = "1010";
+// ---- leave and trips
+// 근태신청's leave and trip forms. A request is saved, linked to an e-approval document and submitted in one
+// approved call, as the web client does it (captured 2026-10-28); a cancel withdraws and deletes a document no
+// one has acted on yet. No edit: the groupware has none either.
+const LEAVE = "1010";   // 연차 and its half and quarter days: the one balance a request counts against
 const hm = (minutes) => String(Math.floor(minutes / 60) * 100 + (minutes % 60)).padStart(4, "0");
 const sameApp = (r, appDt, appSq) => String(r.appDt) === String(appDt) && String(r.appSq) === String(appSq);   // appSq alone may repeat
 // validateNew's refusals come as result codes (live 2026-10-28), 22028 without a message
 const REFUSED = { 22028: "그 기간에 이미 신청한 근태가 있습니다.",
   22023: "남은 연차가 부족하거나 마이너스 연차를 쓸 수 없습니다." };
 
-async function leaveCodes(session, fetch) {
+// What the tools request, by the web form that asks for it (live 2026-11-06): leave whose form asks for a
+// reason alone and runs no check of the company's own (경조휴가 also asks for a relative's resident number,
+// 출산·육아휴직 for more), and trips on the 출장 form taken in whole days (HPD0160's trips ask for a budget)
+async function attendCodes(session, fetch) {
   const base = await request(session, "/human/common/attendapplication/getApplicationBaseInfo", {}, { fetch });
-  const codes = (base?.attendCodeList || []).filter((c) => c.linkAtCd === LEAVE && c.useYn !== "N" && c.outProcessId);
-  if (!codes.length) throw new GroupwareError(`연차 신청 항목을 받지 못했습니다. ${CHECK}`);
-  return { base, codes };
+  const asks = (c) => (base?.formSettingList || []).some((f) => f.atPopupCd === "10" && f.linkAtCd === c.linkAtCd
+    && f.appItem !== "APP_REASON_DC");
+  const checked = (c) => (base?.attendValidationList || []).some((v) => v.linkAtCd === c.linkAtCd && v.ctrTp === "7"
+    && v.ctVal === c.atCd);
+  const usable = (base?.attendCodeList || []).filter((c) => c.useYn !== "N" && c.outProcessId);
+  return { base, leave: usable.filter((c) => c.atPopupCd === "10" && !asks(c) && !checked(c)),
+    trip: usable.filter((c) => c.atPopupCd === "20" && c.timeSetFg !== "NA") };
 }
+const requestable = async (session, fetch) => {
+  const { leave, trip } = await attendCodes(session, fetch);
+  return new Set([...leave, ...trip].map((c) => String(c.atCd)));
+};
 
 async function leaveForm(session, code, fetch) {
   const u = session.user, formDTp = code.outProcessId;
@@ -498,80 +509,183 @@ async function approvalLines(session, form, fetch) {
   return out;
 }
 
-// Everything the request needs, read only: the code, the work-day window, the days it takes, the server's
-// own checks, the title, the form and the approval line
-async function planLeave(session, { kind, start, end = null, reason = "", start_time = null, approval_line = null },
-  { fetch, now }) {
-  const [coCd, empCd] = erp(session);
-  const first = toApiDay(start), last = end ? toApiDay(end) : first;
+const clock = (s) => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s ?? "").trim());
+  return m && Number(m[2]) < 60 ? Number(m[1]) * 60 + Number(m[2]) : NaN;
+};
+const hhmm = (t) => t.replace(/(\d\d)(\d\d)/g, "$1:$2");
+
+// leave: one stretch of work days, and a part day's own hours
+const LEAVE_SPEC = { group: "leave", name: "휴가",
+  fields: () => ({}),
+  times(code, { start_time, end_time }) {
+    const at = clock(start_time);
+    if (num(code.exycCnt) > 0) {   // 반반차: the web form leaves its two hours to the person
+      if (!(at + 120 <= 24 * 60)) throw new GroupwareError(`${code.atNm} 신청에는 시작 시각(start_time, 'HH:MM')이 필요합니다. 2시간으로 신청합니다.`);
+      return [hm(at), hm(at + 120)];
+    }
+    const to = clock(end_time);   // 기타휴가 and the like: the hours the person names
+    if (!(at < to && to <= 24 * 60)) {
+      throw new GroupwareError(`${code.atNm} 신청에는 시작·종료 시각(start_time·end_time, 'HH:MM')이 필요합니다.`);
+    }
+    return [hm(at), hm(to)];
+  },
+  async rows(session, { calc }) {
+    const spans = calc?.holidayExclusionApplicationList || [];
+    if (!spans.length) throw new GroupwareError("그 기간에는 근무일이 없습니다.");
+    // ponytail: one stretch of work days per request; the approval body repeats its table row per stretch, never tried
+    if (spans.length > 1) {
+      const each = spans.map((x) => [...new Set([x.startDt, x.endDt])].map(fmtDate).join("~"));
+      throw new GroupwareError(`주말·휴일로 나뉘는 기간입니다. ${each.join(", ")}로 나눠 따로 신청해 주세요.`);
+    }
+    return spans;
+  },
+  async preview(session, { code, first, last, time, calc, args }, { fetch, now }) {
+    const out = { kind: code.atNm, start: fmtDate(first), end: fmtDate(last), time };
+    if (code.linkAtCd === LEAVE) {
+      const days = num(calc.ycUseCnt), { remaining } = await fetchLeaveBalance(session, {}, { fetch, now });
+      Object.assign(out, { days, remaining_after: remaining - days });
+    }
+    return { ...out, reason: String(args.reason ?? "") };
+  },
+  values: ["kind", "start", "end", "start_time", "end_time", "reason", "approval_line"],
+  schema: (codes, lines, v) => ({ type: "object", required: ["kind", "start", "approval_line"], properties: {
+    kind: kindOf(codes, v), start: dayOf("시작일", v.start), end: dayOf("종료일", v.end, "하루면 비워 두세요"),
+    start_time: { type: "string", title: "시작 시각", description: "반반차·기타휴가처럼 시간을 정하는 휴가만, HH:MM(반반차는 2시간)",
+      ...dflt(true, v.start_time) },
+    end_time: { type: "string", title: "종료 시각", description: "기타휴가처럼 시간을 정하는 휴가만, HH:MM", ...dflt(true, v.end_time) },
+    reason: { type: "string", title: "사유", ...dflt(true, v.reason) }, approval_line: lineField(lines, v) } }),
+  text: (p) => [`${p.kind} ${span(p.start, p.end)} ${p.time}`,
+    ...(p.days !== undefined ? [`연차 ${p.days}일 사용, 신청 후 남는 연차 ${p.remaining_after}일`] : []), `제목: ${p.title}`,
+    `사유: ${p.reason || "(없음)"}`, `결재라인: ${p.approval_line}`].join("\n") };
+
+// trips: one row per work day, each carrying where, why and how (the web form's own fields, captured 2026-11-06)
+const COMMUTE = { AM: "FIELD_IN", PM: "FIELD_OUT", ALL: "FIELD_BOTH" };   // field in and out, as the form sets it from the code
+const TRIP_SPEC = { group: "trip", name: "출장",
+  fields({ place, purpose, task, transport }, base, code) {
+    const where = String(place ?? "").trim(), why = String(purpose ?? "").trim(), name = String(transport ?? "").trim();
+    if (!where) throw new GroupwareError("place(방문처)를 넣어 주세요.");
+    if (!why) throw new GroupwareError("purpose(출장목적)을 넣어 주세요.");
+    const ways = base?.transportationList || [], way = ways.find((t) => t.ctdNm === name);
+    if (name && !way) throw new GroupwareError(`transport는 ${ways.map((t) => t.ctdNm).join("·")} 중 하나로 넣어 주세요.`);
+    // no driver: the form's picker for one is optional
+    return { biztrDc: where, biztrPpsDc: why, taskDc: String(task ?? "").trim(), trafFg: way?.ctdCd ?? "", moveFg: way?.dummy1 ?? "",
+      driverCd: "", depatNm: "", arrivNm: "", stopvNm: "", biztrDistanceDc: "", biztrCommuteTp: COMMUTE[code.timeSetFg] ?? "",
+      biztrAllowancePaidFg: "" };
+  },
+  async rows(session, { code, first, last, startTm, endTm, calc, employee, extra }, { fetch }) {
+    const days = await request(session, "/human/attendapplication/convertPeriodToDailyList", { atCd: code.atCd,
+      linkAtCd: code.linkAtCd, startDt: first, endDt: last, startTm, endTm, appDy: calc.applicationDaysCnt,
+      appTm: calc.applicationMinutes, appRmkDc: "", employeeList: [employee], ...extra }, { fetch });
+    const list = Array.isArray(days) ? days : [];
+    if (!list.length) throw new GroupwareError("그 기간에는 근무일이 없습니다.");
+    // the web form refuses a period that starts or ends on a day off
+    if (![first, last].every((d) => list.some((r) => String(r.atDt) === d))) {
+      throw new GroupwareError("시작일과 종료일은 휴일로 할 수 없습니다.");
+    }
+    return list;
+  },
+  preview: (session, { code, first, last, time, rows, extra, args }) => ({ kind: code.atNm, start: fmtDate(first),
+    end: fmtDate(last), days: rows.length, time, place: extra.biztrDc, purpose: extra.biztrPpsDc, task: extra.taskDc,
+    transport: extra.trafFg ? String(args.transport).trim() : "" }),
+  values: ["kind", "start", "end", "place", "purpose", "task", "transport", "approval_line"],
+  schema: (codes, lines, v, base) => {
+    const ways = (base?.transportationList || []).map((t) => t.ctdNm);
+    return { type: "object", required: ["kind", "start", "place", "purpose", "approval_line"], properties: {
+      kind: kindOf(codes, v), start: dayOf("시작일", v.start), end: dayOf("종료일", v.end, "하루면 비워 두세요"),
+      place: { type: "string", title: "방문처", ...dflt(true, v.place) },
+      purpose: { type: "string", title: "출장목적", ...dflt(true, v.purpose) },
+      task: { type: "string", title: "업무내용", ...dflt(true, v.task) },
+      transport: { type: "string", title: "교통수단", enum: ways, ...dflt(ways.includes(v.transport), v.transport) },
+      approval_line: lineField(lines, v) } };
+  },
+  text: (p) => [`${p.kind} ${span(p.start, p.end)} ${p.time} (${p.days}일)`, `방문처: ${p.place}`, `출장목적: ${p.purpose}`,
+    `업무내용: ${p.task || "(없음)"}`, `교통수단: ${p.transport || "(없음)"}`, `제목: ${p.title}`,
+    `결재라인: ${p.approval_line}`].join("\n") };
+
+// Everything the request needs, read only: the code, the work-day window, the rows it saves, the server's own
+// checks, the title, the form and the approval line
+async function planAttend(session, spec, args, { fetch, now }) {
+  const [coCd, empCd] = erp(session), reason = String(args.reason ?? "");
+  const first = toApiDay(args.start), last = args.end ? toApiDay(args.end) : first;
   if (first > last) throw new GroupwareError(`시작일(${fmtDate(first)})이 종료일(${fmtDate(last)})보다 늦습니다.`);
-  const { base, codes } = await leaveCodes(session, fetch);
-  const code = codes.find((c) => c.atNm === String(kind ?? "").trim());
+  const { base, [spec.group]: codes } = await attendCodes(session, fetch);
+  if (!codes.length) throw new GroupwareError(`${spec.name} 신청 항목을 받지 못했습니다. ${CHECK}`);
+  const code = codes.find((c) => c.atNm === String(args.kind ?? "").trim());
   if (!code) throw new GroupwareError(`kind는 ${codes.map((c) => c.atNm).join("·")} 중 하나로 넣어 주세요.`);
+  const extra = spec.fields(args, base, code);
   const window = await request(session, "/human/common/attendapplication/getStartTmEndTmByWorkType",
-    { empCd, startDate: first, endDate: first, atCd: code.atCd, linkAtCd: LEAVE }, { fetch });
-  let startTm = String(window?.startTm), endTm = String(window?.endTm);
-  if (code.timeSetFg === "NA") {   // 반반차: the web form leaves its two hours to the person
-    const m = /^(\d{1,2}):(\d{2})$/.exec(String(start_time ?? "").trim());
-    const at = m && Number(m[2]) < 60 ? Number(m[1]) * 60 + Number(m[2]) : NaN;
-    if (!(at + 120 <= 24 * 60)) throw new GroupwareError(`${code.atNm}은 시작 시각(start_time, 'HH:MM')을 넣어 주세요. 2시간으로 신청합니다.`);
-    startTm = hm(at); endTm = hm(at + 120);
-  }
+    { empCd, startDate: first, endDate: first, atCd: code.atCd, linkAtCd: code.linkAtCd }, { fetch });
+  const [startTm, endTm] = code.timeSetFg === "NA" ? spec.times(code, args) : [String(window?.startTm), String(window?.endTm)];
   const time = `${startTm}~${endTm}`;
   if (!/^\d{4}~\d{4}$/.test(time)) throw new GroupwareError(`근무 시각을 받지 못했습니다. ${CHECK}`);
   const calc = await request(session, "/human/common/attendapplication/calculateApplicationDays", { startDate: first,
-    endDate: last, startTime: startTm, endTime: endTm, atCd: code.atCd, linkAtCd: LEAVE, empCd, appRmkDc: reason,
+    endDate: last, startTime: startTm, endTime: endTm, atCd: code.atCd, linkAtCd: code.linkAtCd, empCd, appRmkDc: reason,
     calculateOption: "HOLIDAY_EXCLUSION" }, { fetch });
-  const spans = calc?.holidayExclusionApplicationList || [];
-  if (!spans.length) throw new GroupwareError("그 기간에는 근무일이 없습니다.");
-  // ponytail: one stretch of work days per request; the approval body repeats its table row per stretch, never tried
-  if (spans.length > 1) {
-    const each = spans.map((x) => [...new Set([x.startDt, x.endDt])].map(fmtDate).join("~"));
-    throw new GroupwareError(`주말·휴일로 나뉘는 기간입니다. ${each.join(", ")}로 나눠 따로 신청해 주세요.`);
-  }
-  const employee = { empCd, korNm: base.employee?.korNm || "", deptCd: base.employee?.deptCd || "", deptNm: calc.deptNm || "",
+  const employee = { empCd, korNm: base.employee?.korNm || "", deptCd: base.employee?.deptCd || "", deptNm: calc?.deptNm || "",
     divNm: "" };   // the employee record also holds a birth date and a resident number: only these leave it
+  const rows = await spec.rows(session, { code, first, last, startTm, endTm, calc, employee, extra }, { fetch });
   // the fields of the web form's item the check reads (live 2026-10-28: duplicate and short balance still caught)
   const check = await request(session, "/human/attendapplication/validateNew", { checkRange: "ALL", checkPoint: "ADD",
-    empCdList: [empCd], alreadyAddedItems: [], newItem: { coCd, empCd, atCd: code.atCd, linkAtCd: LEAVE,
+    empCdList: [empCd], alreadyAddedItems: [], newItem: { coCd, empCd, atCd: code.atCd, linkAtCd: code.linkAtCd,
       timeSetFg: code.timeSetFg, atDt: ymdOf(now()), startDt: first, endDt: last, startTm, endTm,
       appDy: num(calc.applicationDaysCnt), appDyFg: "D", appTm: num(calc.applicationMinutes), dailyAppTm: num(calc.dailyAppTm),
       ycUseCnt: num(calc.ycUseCnt), dailyCalculatedTimeYcUseCnt: num(calc.dailyCalculatedTimeYcUseCnt), appRmkDc: reason,
       datePeriod: { from: first, to: last }, repeatTp: "NONE", repeatFgList: [], employeeList: [employee],
-      workTp: window?.workTp ?? null, holidayYn: "N" } }, { fetch, full: true });
+      workTp: window?.workTp ?? null, holidayYn: "N", ...extra } }, { fetch, full: true });
   if (String(check.resultCode) !== "0") {
     throw new GroupwareError(REFUSED[check.resultCode] ?? `신청할 수 없습니다(${check.resultMsg || check.resultCode}).`);
   }
   const blocked = Object.entries(check.resultData || {}).filter(([, v]) => filled(v)).map(([k]) => k);
   if (blocked.length) throw new GroupwareError(`신청할 수 없습니다(${blocked.join(", ")}).`);
-  const items = spans.map((x) => ({ ...x, coCd, empCd, deptCd: employee.deptCd, deptNm: employee.deptNm,
+  const items = rows.map((x) => ({ ...x, coCd, empCd, deptCd: employee.deptCd, deptNm: employee.deptNm,
     empNm: calc.empNm || employee.korNm, appRmkDc: reason }));
-  const title = await request(session, "/human/attendapplication/0hr00011", { applicationList: items, employeeList: [employee] },
+  const named = await request(session, "/human/attendapplication/0hr00011", { applicationList: items, employeeList: [employee] },
     { fetch });
-  if (typeof title !== "string" || !title) throw new GroupwareError(`신청서 제목을 받지 못했습니다. ${CHECK}`);
+  if (typeof named !== "string" || !named) throw new GroupwareError(`신청서 제목을 받지 못했습니다. ${CHECK}`);
+  // the company's title rule prints the 연차 count even for leave that takes none (live 2026-11-06: "(0개)기타휴가신청서")
+  const title = num(calc.ycUseCnt) ? named : named.replace("(0개)", "");
   const form = await leaveForm(session, code, fetch);
-  const lines = await approvalLines(session, form, fetch), pick = String(approval_line ?? "").trim();
+  const lines = await approvalLines(session, form, fetch), pick = String(args.approval_line ?? "").trim();
   const line = lines.find((l) => l.id === pick || l.name === pick);
   if (!line) {
     throw new GroupwareError(lines.length ? `approval_line은 저장된 결재라인 ${lines.map((l) => `'${l.name}'`).join("·")} 중 하나로 `
       + "넣어 주세요. 사용자에게 고르게 할 것." : NO_LINES);
   }
-  const days = num(calc.ycUseCnt), { remaining } = await fetchLeaveBalance(session, {}, { fetch, now });
-  return { code, employee, items, title, form, line, first, last, preview: { kind: code.atNm, start: fmtDate(first),
-    end: fmtDate(last), time: time.replace(/(\d\d)(\d\d)/g, "$1:$2"), days, remaining_after: remaining - days, title, reason,
-    approval_line: `${line.name}: ${line.text}` } };
+  const shown = await spec.preview(session, { code, first, last, time: hhmm(time), calc, rows, extra, args }, { fetch, now });
+  return { code, employee, items, title, form, line, first, last,
+    preview: { ...shown, title, approval_line: `${line.name}: ${line.text}` } };
 }
 
-// The web editor swaps each <input mapping_key> of the form for its bound value and wraps head and body
+// The web editor swaps each <input mapping_key> of the form for its bound value and wraps head and body. A
+// group of several rows (a trip's days) repeats the table row its first row's fields sit in, once per row, as
+// the editor's binder does (dze_data_binder.js).
 export function fillBody(mainhtml, bindText) {
   const bind = JSON.parse(bindText), values = { ...bind.ITEMS };
-  const walk = (groups) => (groups || []).forEach((g) => { Object.assign(values, g.items); walk(g.group); });
-  walk(bind.TABLE?.dbTable1?.group);   // the employee row, then the application rows nested in it
-  const body = String(mainhtml).replace(/<input\b[^>]*\bmapping_key="([^"]+)"[^>]*>/g, (_, k) => {
-    if (!Object.hasOwn(values, k)) throw new GroupwareError(`결재 본문 항목(${k})의 값을 받지 못했습니다.`);
-    return html(values[k] ?? "");
+  let body = String(mainhtml);
+  const fill = (part, vals) => part.replace(/<input\b[^>]*\bmapping_key="([^"]+)"[^>]*>/g, (tag, k) => {
+    if (Object.hasOwn(vals, k)) return html(vals[k] ?? "");
+    // a field the data leaves out keeps the form's own text in the field's font, as the editor leaves it
+    const text = /\bvalue="([^"]*)"/.exec(tag)?.[1], style = /\bstyle="([^"]*)"/.exec(tag)?.[1];
+    if (text === undefined) throw new GroupwareError(`결재 본문 항목(${k})의 값을 받지 못했습니다.`);
+    return style ? `<span style="${style}">${text}</span>` : text;
   });
-  return body.replace(/^(<meta charset="utf-8">\s*<style>[^<]*<\/style>)/, "<head>$1\n</head><body>") + "</body>";
+  const repeat = (groups) => {
+    const table = body.indexOf('mapping_key="dbTable1"');
+    const at = Math.min(...Object.keys(groups[0].items || {}).map((k) => body.indexOf(`mapping_key="${k}"`, table)).filter((i) => i > table));
+    const start = body.lastIndexOf("<tr", at), end = body.indexOf("</tr>", at) + "</tr>".length;
+    if (table < 0 || !Number.isFinite(at) || start < table || end < at) throw new GroupwareError("결재 본문의 표에서 반복할 행을 찾지 못했습니다.");
+    const row = body.slice(start, end);
+    body = body.slice(0, start) + groups.map((g) => fill(row, { ...values, ...g.items })).join("") + body.slice(end);
+  };
+  // the employee row, then the application rows nested in it
+  const walk = (groups) => (groups?.length > 1 ? repeat(groups)
+    : (groups || []).forEach((g) => { Object.assign(values, g.items); walk(g.group); }));
+  walk(bind.TABLE?.dbTable1?.group);
+  body = fill(body, values);
+  // the head a browser parses out of the form: its meta and style, unless body content comes first (the 출장 form)
+  const head = /^(<meta charset="utf-8">\s*<style>[^<]*<\/style>)/;
+  return head.test(body) ? `${body.replace(head, "<head>$1\n</head><body>")}</body>` : `<head></head><body>${body}</body>`;
 }
 
 // Link the saved application to a new e-approval document and load its draft. Nothing here makes a
@@ -604,53 +718,49 @@ const discardLeave = (session, { coCd, appDt, appSq }, fetch) => writeOnce(sessi
   "/human/attendapplication/deleteSubmittedApplicationList", [{ coCd, appDt, appSq }], "근태신청 삭제", { fetch });
 
 // ask: a client that can show a form; then the form, not confirm, decides
-export async function requestLeave(session, args = {}, { fetch, now = () => new Date(), ask = null } = {}) {
-  if (ask) return askLeave(session, args, { fetch, now, ask });
-  const plan = await planLeave(session, args, { fetch, now });
-  return args.confirm === true ? submitLeave(session, plan, { fetch, now }) : plan.preview;
+async function requestAttend(session, spec, args, { fetch, now = () => new Date(), ask = null } = {}) {
+  if (ask) return askAttend(session, spec, args, { fetch, now, ask });
+  const plan = await planAttend(session, spec, args ?? {}, { fetch, now });
+  return args?.confirm === true ? submitLeave(session, plan, { fetch, now }) : plan.preview;
 }
+export const requestLeave = (session, args, opts) => requestAttend(session, LEAVE_SPEC, args, opts);
+export const requestTrip = (session, args, opts) => requestAttend(session, TRIP_SPEC, args, opts);
 
-const FIELDS = ["kind", "start", "end", "start_time", "reason", "approval_line"];
-const valuesOf = (o) => Object.fromEntries(FIELDS.map((k) => [k, String(o?.[k] ?? "").trim()]));
 const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
 const span = (start, end) => (end !== start ? `${start}~${end}` : start);
-
-function leaveSchema(codes, lines, v) {
-  const kinds = codes.map((c) => c.atNm), dflt = (ok, x) => (ok && x ? { default: x } : {});
-  return { type: "object", required: ["kind", "start", "approval_line"], properties: {
-    kind: { type: "string", title: "종류", enum: kinds, ...dflt(kinds.includes(v.kind), v.kind) },
-    start: { type: "string", title: "시작일", format: "date", ...dflt(isDay(v.start), v.start) },
-    end: { type: "string", title: "종료일", description: "하루면 비워 두세요", format: "date", ...dflt(isDay(v.end), v.end) },
-    start_time: { type: "string", title: "반반차 시작 시각", description: "반반차만, HH:MM부터 2시간", ...dflt(true, v.start_time) },
-    reason: { type: "string", title: "사유", ...dflt(true, v.reason) },
-    approval_line: { type: "string", title: "결재라인", oneOf: lines.map((l) => ({ const: l.id, title: `${l.name}: ${l.text}` })),
-      ...dflt(lines.some((l) => l.id === v.approval_line), v.approval_line) } } };
-}
-
-const leaveText = (p) => [`${p.kind} ${span(p.start, p.end)} ${p.time}`,
-  `연차 ${p.days}일 사용, 신청 후 남는 연차 ${p.remaining_after}일`, `제목: ${p.title}`, `사유: ${p.reason || "(없음)"}`,
-  `결재라인: ${p.approval_line}`].join("\n");
+const dflt = (ok, x) => (ok && x ? { default: x } : {});
+const kindOf = (codes, v) => {
+  const kinds = codes.map((c) => c.atNm);
+  return { type: "string", title: "종류", enum: kinds, ...dflt(kinds.includes(v.kind), v.kind) };
+};
+const dayOf = (title, x, description) => ({ type: "string", title, ...(description ? { description } : {}), format: "date",
+  ...dflt(isDay(x), x) });
+const lineField = (lines, v) => ({ type: "string", title: "결재라인", oneOf: lines.map((l) => ({ const: l.id, title: `${l.name}: ${l.text}` })),
+  ...dflt(lines.some((l) => l.id === v.approval_line), v.approval_line) });
 
 // The person fills in or corrects every field and sees the plan for exactly those values: an accept with
-// nothing changed submits, a change plans again and asks again.
-async function askLeave(session, args, { fetch, now, ask }) {
-  const { codes } = await leaveCodes(session, fetch);
-  const lines = await approvalLines(session, await leaveForm(session, codes[0], fetch), fetch);
-  if (!lines.length) throw new GroupwareError(NO_LINES);
+// nothing changed submits, a change plans again and asks again. The lines offered are the chosen kind's form's.
+async function askAttend(session, spec, args, { fetch, now, ask }) {
+  const valuesOf = (o) => Object.fromEntries(spec.values.map((k) => [k, String(o?.[k] ?? "").trim()]));
+  const { base, [spec.group]: codes } = await attendCodes(session, fetch);
+  if (!codes.length) throw new GroupwareError(`${spec.name} 신청 항목을 받지 못했습니다. ${CHECK}`);
   let v = valuesOf(args);
-  v.approval_line = lines.find((l) => l.id === v.approval_line || l.name === v.approval_line)?.id
-    ?? (lines.length === 1 && !v.approval_line ? lines[0].id : v.approval_line);
   for (;;) {
+    const code = codes.find((c) => c.atNm === v.kind) ?? codes[0];
+    const lines = await approvalLines(session, await leaveForm(session, code, fetch), fetch);
+    if (!lines.length) throw new GroupwareError(NO_LINES);
+    v.approval_line = lines.find((l) => l.id === v.approval_line || l.name === v.approval_line)?.id
+      ?? (lines.length === 1 && !v.approval_line ? lines[0].id : v.approval_line);
     let plan = null, message;
     try {
-      plan = await planLeave(session, v, { fetch, now });
-      message = `${leaveText(plan.preview)}\n\n값을 바꾸지 않고 승인하면 바로 상신되고 결재자에게 알림이 갑니다. `
+      plan = await planAttend(session, spec, v, { fetch, now });
+      message = `${spec.text(plan.preview)}\n\n값을 바꾸지 않고 승인하면 바로 상신되고 결재자에게 알림이 갑니다. `
         + "값을 바꾸면 다시 계산해 보여 드립니다.";
     } catch (e) {
       if (e instanceof SessionError) throw e;
-      message = v.kind && v.start ? `휴가 신청 내용을 확인해 주세요.\n${e.message}` : "휴가 신청 내용을 입력해 주세요.";
+      message = v.kind && v.start ? `${spec.name} 신청 내용을 확인해 주세요.\n${e.message}` : `${spec.name} 신청 내용을 입력해 주세요.`;
     }
-    const r = await ask({ message, requestedSchema: leaveSchema(codes, lines, v) });
+    const r = await ask({ message, requestedSchema: spec.schema(codes, lines, v, base) });
     if (r?.action !== "accept") return { submitted: false, note: "폼에서 승인받지 못해 신청하지 않았습니다." };
     const next = valuesOf(r.content);
     if (plan && JSON.stringify(next) === JSON.stringify(v)) return submitLeave(session, plan, { fetch, now });
@@ -750,14 +860,15 @@ async function deleteDoc(session, docId, fetch) {
 
 const CANCEL = { 0: "결재 전 문서를 회수한 뒤 삭제합니다.", 5: "임시보관 문서를 삭제합니다.", 2: "결재 문서 없이 저장만 된 신청을 지웁니다." };
 
-const cancelable = (r) => r.linkAtCd === LEAVE && Object.hasOwn(CANCEL, String(r.approState)) && r.reportCancYn !== "Y"
-  && String(r.cancellationApplication) !== "true";
+const cancelable = (codes) => (r) => codes.has(String(r.atCd)) && Object.hasOwn(CANCEL, String(r.approState))
+  && r.reportCancYn !== "Y" && String(r.cancellationApplication) !== "true";
 // ask: a client that can show a form; the person picks one of the requests still cancelable and the pick
 // cancels it, confirm aside
 export async function cancelLeave(session, { id = null, confirm = false } = {}, { fetch, now = () => new Date(), ask = null } = {}) {
   if (!ask) return cancelOne(session, id, confirm === true, fetch);
   const year = now().getFullYear(), options = new Map(), given = String(id ?? "").trim();
-  for (const r of (await leaveRows(session, `${year}0101`, `${year + 1}1231`, { fetch })).filter(cancelable)) {
+  const codes = await requestable(session, fetch);
+  for (const r of (await leaveRows(session, `${year}0101`, `${year + 1}1231`, { fetch })).filter(cancelable(codes))) {
     const key = `${r.appDt}-${r.appSq}`;   // one application, however many stretches
     if (!options.has(key)) {
       options.set(key, `${span(fmtDate(r.startDt), fmtDate(r.endDt))} ${r.atItemNm || r.atCdNm || r.atNm || ""} (${leaveStatus(r)})`
@@ -768,8 +879,8 @@ export async function cancelLeave(session, { id = null, confirm = false } = {}, 
     const p = await cancelOne(session, given, false, fetch);
     options.set(given, `${span(p.start, p.end)} ${p.kind} (${p.status})`);
   }
-  if (!options.size) return { canceled: false, note: "결재 전이라 취소할 수 있는 연차 신청이 없습니다. 결재가 끝난 신청은 그룹웨어 근태신청에서 결재취소해 주세요." };
-  const r = await ask({ message: "취소할 연차 신청을 고르세요. 승인하면 바로 취소되며 되돌릴 수 없습니다. "
+  if (!options.size) return { canceled: false, note: "결재 전이라 취소할 수 있는 휴가·출장 신청이 없습니다. 결재가 끝난 신청은 그룹웨어 근태신청에서 결재취소해 주세요." };
+  const r = await ask({ message: "취소할 휴가·출장 신청을 고르세요. 승인하면 바로 취소되며 되돌릴 수 없습니다. "
     + "결재 진행 중인 문서는 회수한 뒤 삭제합니다.", requestedSchema: { type: "object", required: ["id"], properties: {
     id: { type: "string", title: "신청", oneOf: [...options].map(([k, title]) => ({ const: k, title })),
       ...(options.has(given) ? { default: given } : {}) } } } });
@@ -790,7 +901,9 @@ async function cancelOne(session, id, confirm, fetch) {
   const first = days[0], last = days.at(-1);
   const row = (await leaveRows(session, first, last, { fetch })).find((r) => sameApp(r, appDt, appSq));
   if (!row) throw new GroupwareError(`근태신청(id ${id})을 찾을 수 없습니다.`);
-  if (row.linkAtCd !== LEAVE) throw new GroupwareError("연차·반차·반반차 신청만 취소할 수 있습니다.");
+  if (!(await requestable(session, fetch)).has(String(row.atCd))) {
+    throw new GroupwareError("leave_request·trip_request로 신청하는 휴가·출장만 취소할 수 있습니다.");
+  }
   // a cancel form in flight, or the leave it cancels: never tried here
   if (row.reportCancYn === "Y" || String(row.cancellationApplication) === "true") {
     throw new GroupwareError(`결재취소가 걸린 신청은 그룹웨어에서 처리해 주세요. ${CHECK}`);
