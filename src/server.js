@@ -146,7 +146,7 @@ const TOOLS = [
   ["approval_list", READ_ONLY, read.fetchApprovals,
     { box: str("submitted"), start: orNone(z.string()), end: orNone(z.string()), page: int(1), count: int(20) },
     "전자결재 문서 목록. box는 'submitted'(상신)·'draft'(임시보관)·'pending'(미결, 내가 결재할 문서)·"
-    + "'reference'(수신참조, 나를 참조로 넣은 문서).\n"
+    + "'reference'(수신참조, 나를 참조로 넣은 문서)·'approved'(기결, 내가 결재한 문서)·'completed'(완료, 내가 상신해 종결된 문서).\n"
     + "start/end는 'YYYY-MM-DD', 생략하면 올해. doc_id·form_id는 approval_read에 쓴다."],
   ["approval_read", OPENS, read.fetchApproval, { doc_id: strOrInt, form_id: strOrInt },
     "전자결재 문서 상세: 결재선과 본문 텍스트. 미결·수신참조 문서를 열면 기안자에게 열람으로 보일 수 있다."],

@@ -474,20 +474,23 @@ const APPROVAL_BOXES = {
   draft: ["/eap/eap107A06", "UBA1020", "REP_DT", "1000300", "1000500", "list"],
   pending: ["/eap/eap105A04", "UBA2020", "ARRIVED_DT", "1000900", "1001000", "map"],
   reference: ["/eap/eap105A04", "UBA2040", "ARRIVED_DT", "1000900", "1001200", "map"],   // 수신참조문서 (gw999A03, live 2026-11-03)
+  approved: ["/eap/eap105A04", "UBA2030", "ARRIVED_DT", "1000900", "1001100", "map"],    // 기결함, 내가 결재한 문서 (live 2026-11-08)
+  completed: ["/eap/eap107A04", "UBA1010", "REP_DT", "1000300", "1000400", "list", ["90"]],   // 상신 문서 중 종결
 };
 const DOC_STATUS = { 10: "임시보관", 20: "상신", 90: "종결" };
 
 export async function fetchApprovals(session, { box = "submitted", start = null, end = null, page = 1, count = 20 } = {},
   { fetch, now = () => new Date() } = {}) {
   if (!Object.hasOwn(APPROVAL_BOXES, box)) throw new GroupwareError(`box는 ${Object.keys(APPROVAL_BOXES).join(", ")} 중 하나여야 합니다.`);
-  const [path, pageCode, picker, boxId, menuNo, shape] = APPROVAL_BOXES[box];
+  const [path, pageCode, picker, boxId, menuNo, shape, docSts = []] = APPROVAL_BOXES[box];
   const year = now().getFullYear();
   const [first, last] = inOrder(start ? toApiDay(start) : `${year}0101`, end ? toApiDay(end) : `${year}1231`);
   const data = await request(session, path, {
-    fDocSts: [], page: String(page), pageSize: String(count), eaBoxId: boxId, nMenuID: menuNo, sfrDt: first,
+    fDocSts: docSts, page: String(page), pageSize: String(count), eaBoxId: boxId, nMenuID: menuNo, sfrDt: first,
     stoDt: last, sFormId: ["0"], periodPicker: picker, sortField: picker, sortType: "DESC", docContentsData: {},
     item: {}, useElasticSearch: true, useElasticSearch_new: true, pageCode, upperMenuNo: boxId, menuNo }, { fetch });
-  return (data?.[shape]?.list || []).map((d) => ({
+  const rows = (data?.[shape]?.list || []).filter((d) => !docSts.length || docSts.includes(String(d.DOC_STS)));
+  return rows.map((d) => ({
     doc_id: d.DOC_ID ?? null,
     form_id: d.FORM_ID ?? null,
     title: d.DOC_TITLE || "",
